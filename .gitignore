@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output (Vite)
+dist/
+renderer/
+
+# electron-builder output
+release/
+out/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Electron user data (encryption keys, encrypted store)
+# These live in the OS userData path, not the repo, but guard against
+# accidental commits if someone copies them here for debugging.
+*.sskey
+*.sskeyf
+servesafe.json
+config.json
+config.json.bak
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+coverage/
