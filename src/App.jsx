@@ -43,6 +43,7 @@ const api = isBrowser ? {
   openDownload: () => Promise.resolve(),
   showDownload: () => Promise.resolve(),
   getTrackerStats: () => Promise.resolve(0),
+  getAdStats: () => Promise.resolve(0),
   getTheme: () => Promise.resolve('light'),
   overlayOpen: () => Promise.resolve(),
   overlayClose: () => Promise.resolve(),
@@ -78,7 +79,7 @@ export default function App() {
   useEffect(() => {
     if (isBrowser) return
     api.getAuthState().then(state => {
-      setLocked(state?.appLockEnabled !== false)
+      setLocked(state?.appLockEnabled !== false && state?.isLocked !== false)
     })
   }, [])
 
@@ -124,6 +125,7 @@ function BrowserApp() {
   // ── Privacy ──────────────────────────────────────────────────────────────────
   const [permissionRequest, setPermissionRequest] = useState(null) // { id, origin, permission }
   const [trackerCounts, setTrackerCounts] = useState({})           // { tabId: number }
+  const [adCounts, setAdCounts] = useState({})                     // { tabId: number }
   const [httpsBlockedUrl, setHttpsBlockedUrl] = useState(null)
 
   // ── Downloads ────────────────────────────────────────────────────────────────
@@ -284,6 +286,9 @@ function BrowserApp() {
       api.on('tracker-blocked', ({ tabId, count }) =>
         startTransition(() => setTrackerCounts(prev => ({ ...prev, [tabId]: count })))
       ),
+      api.on('ad-blocked', ({ tabId, count }) =>
+        startTransition(() => setAdCounts(prev => ({ ...prev, [tabId]: count })))
+      ),
 
       // Menu: tab actions (need activeId closure)
       api.on('menu-close-tab', () => setActiveId(id => { if (id) closeTab(id); return id })),
@@ -329,11 +334,24 @@ function BrowserApp() {
     setCertErrorTabs(prev => { const n = new Set(prev); n.delete(id); return n })
     setCertWarning(prev => prev?.tabId === id ? null : prev)
     setTrackerCounts(prev => { const n = { ...prev }; delete n[id]; return n })
+    setAdCounts(prev => { const n = { ...prev }; delete n[id]; return n })
   }, [activeId, openNewTab])
 
   const switchTab = useCallback(async (id) => {
     await api.switchTab(id)
     setActiveId(id)  // must be immediate — BrowserView already swapped
+  }, [])
+
+  const moveTab = useCallback((fromId, toId) => {
+    setTabs(prev => {
+      const from = prev.findIndex(t => t.id === fromId)
+      const to = prev.findIndex(t => t.id === toId)
+      if (from === -1 || to === -1 || from === to) return prev
+      const next = [...prev]
+      const [moved] = next.splice(from, 1)
+      next.splice(to, 0, moved)
+      return next
+    })
   }, [])
 
   const navigate = useCallback(async (url) => {
@@ -403,6 +421,7 @@ function BrowserApp() {
   const showNewTabPage = !activeTab?.url || activeTab.url === '' || activeTab.url === 'about:blank'
   const hasCertError = certErrorTabs.has(activeId)
   const trackerCount = trackerCounts[activeId] || 0
+  const adCount = adCounts[activeId] || 0
 
   return (
     <>
@@ -414,6 +433,9 @@ function BrowserApp() {
           onClose={closeTab}
           onNew={() => openNewTab()}
           onNewIncognito={() => openIncognitoTab()}
+          onMove={moveTab}
+          onOverlayOpen={api.overlayOpen}
+          onOverlayClose={api.overlayClose}
         />
         <AddressBar
           url={activeTab?.url || ''}
@@ -423,6 +445,7 @@ function BrowserApp() {
           isBookmarked={isBookmarked}
           hasCertError={hasCertError}
           trackerCount={trackerCount}
+          adCount={adCount}
           onNavigate={navigate}
           onBack={() => activeId && api.goBack(activeId)}
           onForward={() => activeId && api.goForward(activeId)}
@@ -496,6 +519,7 @@ function BrowserApp() {
           onClose={() => closePanel(setShowPrivacy)}
           activeTabId={activeId}
           trackerCount={trackerCount}
+          adCount={adCount}
         />
       )}
     </>

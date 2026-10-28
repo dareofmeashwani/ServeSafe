@@ -15,7 +15,7 @@ function Toggle({ on, onChange }) {
   )
 }
 
-export function PrivacyPanel({ onClose, activeTabId, trackerCount }) {
+export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount }) {
   const [settings, setSettings] = useState(null)
   const [permissions, setPermissions] = useState({})
   const [clearFlags, setClearFlags] = useState({ history: true, cookies: false, cache: false })
@@ -53,6 +53,7 @@ export function PrivacyPanel({ onClose, activeTabId, trackerCount }) {
   if (!settings) return null
 
   const toggleDefs = [
+    { key: 'blockAds',               label: t.blockAds,               desc: t.blockAdsDesc },
     { key: 'blockTrackers',          label: t.blockTrackers,          desc: t.blockTrackersDesc },
     { key: 'doNotTrack',             label: t.doNotTrack,             desc: t.doNotTrackDesc },
     { key: 'globalPrivacyControl',   label: t.globalPrivacyControl,   desc: t.globalPrivacyControlDesc },
@@ -84,6 +85,13 @@ export function PrivacyPanel({ onClose, activeTabId, trackerCount }) {
                 <div className="privacy-stat">
                   <span className="privacy-stat-num">{trackerCount}</span>
                   <span className="privacy-stat-label">{t.trackersBlockedPage(trackerCount)}</span>
+                </div>
+              )}
+
+              {adCount > 0 && (
+                <div className="privacy-stat">
+                  <span className="privacy-stat-num">{adCount}</span>
+                  <span className="privacy-stat-label">{t.adsBlockedPage(adCount)}</span>
                 </div>
               )}
 

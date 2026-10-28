@@ -66,11 +66,9 @@ input { font: inherit; color: var(--text); }
   padding: 6px 8px 0;
   padding-left: 80px; /* macOS traffic lights */
   gap: 2px;
-  overflow-x: auto;
-  scrollbar-width: none;
+  overflow: visible;
   -webkit-app-region: drag;
 }
-.tab-bar::-webkit-scrollbar { display: none; }
 
 .tab {
   display: flex;
@@ -88,8 +86,15 @@ input { font: inherit; color: var(--text); }
   position: relative;
   transition: background 0.1s;
 }
-.tab.active { background: var(--tab-active); }
-.tab:hover:not(.active) { background: color-mix(in srgb, var(--tab-bg) 70%, var(--tab-active)); }
+.tab.active {
+  background: var(--tab-active);
+  color: var(--text);
+  box-shadow: inset 0 2px 0 0 var(--accent), 0 2px 6px rgba(0,0,0,0.12);
+}
+.tab:not(.active) { color: var(--text-muted); }
+.tab:not(.active) .tab-favicon { opacity: 0.7; }
+.tab:hover:not(.active) { background: color-mix(in srgb, var(--tab-bg) 60%, var(--tab-active)); color: var(--text); }
+.tab.drag-over { outline: 2px solid var(--accent, #4c8bf5); outline-offset: -2px; }
 
 .tab-favicon { width: 16px; height: 16px; flex-shrink: 0; }
 .tab-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
@@ -100,6 +105,32 @@ input { font: inherit; color: var(--text); }
 
 .new-tab-btn { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; opacity: 0.6; flex-shrink: 0; -webkit-app-region: no-drag; margin-bottom: 2px; }
 .new-tab-btn:hover { opacity: 1; background: var(--btn-hover); }
+
+/* ── Tab bar actions (new-tab buttons group) ─────────────────────────────────── */
+.tab-bar-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; -webkit-app-region: no-drag; }
+
+/* ── Tab overflow dropdown ───────────────────────────────────────────────────── */
+.tab-overflow-wrap { position: relative; flex-shrink: 0; -webkit-app-region: no-drag; margin-bottom: 2px; }
+.tab-overflow-btn {
+  height: 28px; padding: 0 8px; border-radius: 4px; font-size: 12px; font-weight: 500;
+  opacity: 0.7; white-space: nowrap; -webkit-app-region: no-drag; color: inherit;
+}
+.tab-overflow-btn:hover, .tab-overflow-btn.has-active { opacity: 1; background: var(--btn-hover); }
+.tab-overflow-dropdown {
+  position: absolute; top: calc(100% + 6px); right: 0;
+  min-width: 220px; max-height: 320px; overflow-y: auto;
+  background: var(--chrome-bg); border: 1px solid var(--chrome-border);
+  border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  z-index: 9999; padding: 4px;
+}
+.tab-overflow-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.tab-overflow-item:hover { background: var(--btn-hover); }
+.tab-overflow-item.active { background: var(--tab-active); }
+.tab-overflow-favicon { width: 14px; height: 14px; flex-shrink: 0; }
+.tab-overflow-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Nav bar ─────────────────────────────────────────────────────────────────── */
 .nav-bar {
@@ -261,9 +292,14 @@ input { font: inherit; color: var(--text); }
 .popover-row.muted { color: var(--text-muted); }
 
 /* ── Incognito ────────────────────────────────────────────────────────────────── */
-.tab.is-incognito { background: #3d2b6b; color: #e0d4ff; }
-.tab.is-incognito.active { background: #4e3880; }
-.tab.is-incognito:hover:not(.active) { background: #452f77; }
+.tab.is-incognito { background: #3d2b6b; color: #bda9ec; }
+.tab.is-incognito:not(.active) .tab-favicon { opacity: 0.7; }
+.tab.is-incognito.active {
+  background: #5a3f99;
+  color: #f1e9ff;
+  box-shadow: inset 0 2px 0 0 #b196f0, 0 2px 6px rgba(0,0,0,0.3);
+}
+.tab.is-incognito:hover:not(.active) { background: #4a3488; color: #f1e9ff; }
 .incognito-btn { font-size: 14px; }
 .incognito-page .new-tab-title { color: #9b7fe8; }
 .incognito-notice { font-size: 13px; color: var(--text-muted); max-width: 420px; text-align: center; line-height: 1.5; }

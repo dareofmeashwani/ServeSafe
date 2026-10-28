@@ -8,7 +8,7 @@ const ALLOWED_EVENTS = [
   'menu-new-incognito',
   // Security / privacy
   'cert-error', 'permission-request',
-  'https-only-blocked', 'tracker-blocked',
+  'https-only-blocked', 'tracker-blocked', 'ad-blocked',
   // Downloads
   'download-started', 'download-updated', 'download-done',
   // App lock
@@ -61,6 +61,9 @@ contextBridge.exposeInMainWorld('browser', {
 
   // ── Tracker stats ─────────────────────────────────────────────────────────
   getTrackerStats: (tabId) => ipcRenderer.invoke('tracker-stats-get', { tabId }),
+
+  // ── Ad stats ──────────────────────────────────────────────────────────────
+  getAdStats: (tabId) => ipcRenderer.invoke('ad-stats-get', { tabId }),
 
   // ── Chrome height reporting (renderer → main for correct BrowserView layout) ──
   setChromeHeight: (cssHeight) => ipcRenderer.send('set-chrome-height', cssHeight),

@@ -16,7 +16,7 @@ const fs = require('fs')
 const storeKey = require('./storeKey')
 const security = require('./security')
 const privacy = require('./privacy')
-const { isTracker } = require('./trackerData')
+const filterEngine = require('./filterEngine')
 
 let store  // set to the encrypted electron-store instance in app.whenReady()
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged// Anti-fingerprinting script — loaded once, injected into every page via CDP
@@ -36,24 +36,53 @@ if (process.platform === 'darwin' && !app.isPackaged) {
 // Prevent WebRTC from leaking the local LAN IP — only the public interface is used
 app.commandLine.appendSwitch('webrtc-ip-handling-policy', 'default_public_interface_only')
 
-// ─── Global state ─────────────────────────────────────────────────────────────
-let mainWindow
-const browserViews = new Map()   // tabId -> BrowserView
-const incognitoTabs = new Set()  // tabIds using the incognito session
-const trackerStats = new Map()   // tabId -> count
+// ─── Per-window state ─────────────────────────────────────────────────────────
+// Each BrowserWindow gets its own state object so multiple windows are fully
+// isolated: separate tab sets, BrowserViews, overlay flags, chrome heights, etc.
+const windowStates = new Map()  // winId -> state
 
-// Pending permission requests: id -> callback
+function createWindowState(win) {
+  return {
+    win,
+    browserViews:       new Map(),  // tabId -> BrowserView
+    trackerStats:       new Map(),  // tabId -> count
+    adStats:            new Map(),  // tabId -> count
+    activeTabId:        null,
+    chromeHeight:       88,
+    chromeHeightTimer:  null,
+    overlayActive:      false,
+  }
+}
+
+// ─── Window state lookups ──────────────────────────────────────────────────────
+function getWS(senderWebContents) {
+  for (const ws of windowStates.values()) {
+    if (ws.win.webContents === senderWebContents) return ws
+  }
+  return null
+}
+
+function getWSByViewWebContentsId(wcId) {
+  for (const ws of windowStates.values()) {
+    for (const view of ws.browserViews.values()) {
+      try { if (view.webContents.id === wcId) return ws } catch {}
+    }
+  }
+  return null
+}
+
+function sendToWindow(ws, channel, payload) {
+  if (ws && ws.win && !ws.win.isDestroyed()) ws.win.webContents.send(channel, payload)
+}
+
+// ─── Global state (shared across all windows) ─────────────────────────────────
+const incognitoTabs = new Set()  // tabIds using the incognito session (globally unique)
+const downloads = []             // in-memory download list, shown in all windows
+
+// Pending permission requests: id -> callback (keyed globally; permissions span windows)
 const pendingPermissions = new Map()
 let permCounter = 0
 function newPermId() { return `perm_${++permCounter}` }
-
-// In-memory download list
-const downloads = []
-
-let activeTabId = null
-let chromeHeight = 88  // updated dynamically from renderer via ResizeObserver
-let chromeHeightTimer = null
-let overlayActive = false  // true while a React panel is open (BrowserView must stay hidden)
 
 // Worker pool for request filtering (initialized in app.whenReady)
 
@@ -143,7 +172,9 @@ function setupSession(sess, { incognito = false } = {}) {
       }
     }, 30_000)
 
-    sendToRenderer('permission-request', { id, origin, permission })
+    // Find the window that owns this webContents and send to it
+    const ownerWS = getWSByViewWebContentsId(wc.id) || [...windowStates.values()][0]
+    sendToWindow(ownerWS, 'permission-request', { id, origin, permission })
   })
 
   sess.setPermissionCheckHandler((wc, permission) => {
@@ -169,21 +200,37 @@ function setupSession(sess, { incognito = false } = {}) {
       } else if (settings.httpsOnly && details.url.startsWith('http://') &&
                  hostname !== 'localhost' && !hostname.startsWith('127.')) {
         cancel = true; reason = 'https-only'
-      } else if (settings.blockTrackers && isTracker(details.url)) {
+      } else if (settings.blockTrackers && filterEngine.matchTrackers(details)) {
         cancel = true; reason = 'tracker'
+      } else if (settings.blockAds && filterEngine.matchAds(details)) {
+        cancel = true; reason = 'ad'
       }
     } catch { /* unparseable URL — allow through */ }
 
-    if (cancel && reason === 'tracker') {
-      const tabId = [...browserViews.entries()]
-        .find(([, v]) => { try { return v.webContents.id === details.webContentsId } catch { return false } })?.[0]
-      if (tabId) {
-        trackerStats.set(tabId, (trackerStats.get(tabId) || 0) + 1)
-        sendToRenderer('tracker-blocked', { tabId, url: details.url, count: trackerStats.get(tabId) })
+    if (cancel && (reason === 'tracker' || reason === 'ad')) {
+      const ownerWS = getWSByViewWebContentsId(details.webContentsId)
+      if (ownerWS) {
+        let tabId
+        for (const [id, v] of ownerWS.browserViews) {
+          try { if (v.webContents.id === details.webContentsId) { tabId = id; break } } catch {}
+        }
+        if (tabId) {
+          if (reason === 'tracker') {
+            const count = (ownerWS.trackerStats.get(tabId) || 0) + 1
+            ownerWS.trackerStats.set(tabId, count)
+            sendToWindow(ownerWS, 'tracker-blocked', { tabId, url: details.url, count })
+          } else {
+            const count = (ownerWS.adStats.get(tabId) || 0) + 1
+            ownerWS.adStats.set(tabId, count)
+            sendToWindow(ownerWS, 'ad-blocked', { tabId, url: details.url, count })
+          }
+        }
       }
     }
     if (cancel && reason === 'https-only') {
-      sendToRenderer('https-only-blocked', { url: details.url })
+      const ownerWS = getWSByViewWebContentsId(details.webContentsId)
+        || [...windowStates.values()][0]
+      sendToWindow(ownerWS, 'https-only-blocked', { url: details.url })
     }
 
     cb({ cancel })
@@ -246,10 +293,13 @@ function setupSession(sess, { incognito = false } = {}) {
     const settings = privacy.getSettings()
     const headers = { ...details.responseHeaders }
 
-    // Inject a strict Content-Security-Policy on the main renderer window to
+    // Inject a strict Content-Security-Policy on any renderer window to
     // prevent XSS from escalating into full IPC access via window.browser.
     // BrowserView webContents have different IDs so they are not affected.
-    if (mainWindow && details.webContentsId === mainWindow.webContents.id) {
+    const isRendererWindow = [...windowStates.values()].some(ws =>
+      !ws.win.isDestroyed() && ws.win.webContents.id === details.webContentsId
+    )
+    if (isRendererWindow) {
       headers['Content-Security-Policy'] = [isDev
         // Dev: allow eval + inline (Vite HMR & @vitejs/plugin-react preamble) and localhost WebSocket
         ? "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; object-src 'none'; base-uri 'self';"
@@ -272,32 +322,32 @@ function setupSession(sess, { incognito = false } = {}) {
     cb({ responseHeaders: headers })
   })
 
-  // Download tracking
+  // Download tracking — broadcast to all open windows
   sess.on('will-download', (event, item) => {
     const dlId = `dl_${Date.now()}`
     const filename = item.getFilename()
     const dl = { id: dlId, filename, url: item.getURL(), state: 'progressing', received: 0, total: item.getTotalBytes(), savePath: '' }
     downloads.push(dl)
-    sendToRenderer('download-started', { ...dl })
+    for (const ws of windowStates.values()) sendToWindow(ws, 'download-started', { ...dl })
 
     item.on('updated', (_, state) => {
       dl.state = state
       dl.received = item.getReceivedBytes()
       dl.total = item.getTotalBytes()
-      sendToRenderer('download-updated', { id: dlId, state, received: dl.received, total: dl.total })
+      for (const ws of windowStates.values()) sendToWindow(ws, 'download-updated', { id: dlId, state, received: dl.received, total: dl.total })
     })
 
     item.once('done', (_, state) => {
       dl.state = state
       dl.savePath = item.getSavePath()
-      sendToRenderer('download-done', { id: dlId, state, savePath: dl.savePath, filename })
+      for (const ws of windowStates.values()) sendToWindow(ws, 'download-done', { id: dlId, state, savePath: dl.savePath, filename })
     })
   })
 }
 
 // ─── Window creation ───────────────────────────────────────────────────────────
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 1280,
     height: 800,
     minWidth: 800,
@@ -315,62 +365,77 @@ function createWindow() {
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#ffffff',
   })
 
+  const ws = createWindowState(win)
+  windowStates.set(win.id, ws)
+
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173')
-    mainWindow.webContents.openDevTools({ mode: 'detach' })
+    win.loadURL('http://localhost:5173')
+    // Only auto-open DevTools for the first window to avoid clutter
+    if (windowStates.size === 1) win.webContents.openDevTools({ mode: 'detach' })
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
+    win.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
 
-  mainWindow.on('close', () => {
+  win.on('close', () => {
     // Save open (non-incognito) tabs so they can be restored on next launch.
-    const tabs = []
-    browserViews.forEach((view, tabId) => {
-      if (incognitoTabs.has(tabId)) return
-      const url = view.webContents.getURL()
-      if (url && url !== 'about:blank') {
-        tabs.push({ url, title: view.webContents.getTitle() || url, wasActive: tabId === activeTabId })
+    // Only save for the last remaining window — earlier-closed windows are not persisted.
+    if (windowStates.size === 1) {
+      const tabs = []
+      ws.browserViews.forEach((view, tabId) => {
+        if (incognitoTabs.has(tabId)) return
+        const url = view.webContents.getURL()
+        if (url && url !== 'about:blank') {
+          tabs.push({ url, title: view.webContents.getTitle() || url, wasActive: tabId === ws.activeTabId })
+        }
+      })
+      if (tabs.length > 0) {
+        if (!tabs.some(t => t.wasActive)) tabs[tabs.length - 1].wasActive = true
+        store.set('lastSession', { tabs })
+      } else {
+        store.delete('lastSession')
       }
-    })
-    if (tabs.length > 0) {
-      if (!tabs.some(t => t.wasActive)) tabs[tabs.length - 1].wasActive = true
-      store.set('lastSession', { tabs })
-    } else {
-      store.delete('lastSession')
     }
   })
 
-  mainWindow.on('closed', () => {
-    browserViews.forEach(v => v.webContents.destroy())
-    browserViews.clear()
-    mainWindow = null
+  win.on('closed', () => {
+    ws.browserViews.forEach(v => { incognitoTabs.delete(v._tabId); v.webContents.destroy() })
+    ws.browserViews.clear()
+    windowStates.delete(win.id)
   })
 
-  mainWindow.on('resize', () => {
-    if (activeTabId && browserViews.has(activeTabId)) {
-      layoutBrowserView(browserViews.get(activeTabId))
+  win.on('resize', () => {
+    if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
+      layoutBrowserView(ws, ws.browserViews.get(ws.activeTabId))
     }
   })
 
   buildMenu()
+  return win
 }
 
+// Keep `sendToRenderer` for menu actions — targets the focused window.
+function sendToRenderer(channel, payload) {
+  const win = BrowserWindow.getFocusedWindow() || [...windowStates.values()][0]?.win
+  if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
+}
+
+
 // ─── BrowserView layout ────────────────────────────────────────────────────────
-function layoutBrowserView(view) {
-  if (!mainWindow || overlayActive) return
+function layoutBrowserView(ws, view) {
+  if (!ws.win || ws.overlayActive) return
   const url = view.webContents.getURL()
   if (!url || url === 'about:blank') {
     // New-tab page: keep view fully detached so React renders through unobstructed.
-    mainWindow.removeBrowserView(view)
+    ws.win.removeBrowserView(view)
     return
   }
-  if (!mainWindow.getBrowserViews().includes(view)) mainWindow.addBrowserView(view)
-  const [w, h] = mainWindow.getContentSize()
-  view.setBounds({ x: 0, y: chromeHeight, width: w, height: Math.max(1, h - chromeHeight) })
+  if (!ws.win.getBrowserViews().includes(view)) ws.win.addBrowserView(view)
+  const [w, h] = ws.win.getContentSize()
+  view.setBounds({ x: 0, y: ws.chromeHeight, width: w, height: Math.max(1, h - ws.chromeHeight) })
 }
 
 // ─── Tab helpers ───────────────────────────────────────────────────────────────
-function createBrowserView(tabId, url = 'about:blank', { incognito = false } = {}) {
+function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false } = {}) {
   const viewSession = incognito ? session.fromPartition('incognito') : session.defaultSession
 
   const view = new BrowserView({
@@ -402,7 +467,7 @@ function createBrowserView(tabId, url = 'about:blank', { incognito = false } = {
       const hostname = new URL(url).hostname
       if (security.hasException(hostname)) { callback(true); return }
       const id = security.storeCertCallback(callback)
-      sendToRenderer('cert-error', {
+      sendToWindow(ws, 'cert-error', {
         id, tabId, url, error,
         certSubject: cert.subjectName || hostname,
       })
@@ -414,62 +479,66 @@ function createBrowserView(tabId, url = 'about:blank', { incognito = false } = {
   // ── Navigation events → renderer ──
   view.webContents.on('did-navigate', (_, navUrl) => {
     resetActivity()
-    sendToRenderer('tab-navigated', { tabId, url: navUrl })
-    trackerStats.set(tabId, 0) // reset tracker count on full navigation
-    if (tabId === activeTabId) layoutBrowserView(view)
+    sendToWindow(ws, 'tab-navigated', { tabId, url: navUrl })
+    ws.trackerStats.set(tabId, 0) // reset tracker count on full navigation
+    ws.adStats.set(tabId, 0)      // reset ad count on full navigation
+    view._cosmeticKey = null      // CSS cleared by navigation; allow re-inject on dom-ready
+    if (tabId === ws.activeTabId) layoutBrowserView(ws, view)
     // Re-apply location on every full navigation — each cross-origin nav creates a
     // fresh renderer process that loses any previously set CDP override.
     const loc = store.get('location', null)
     if (loc && loc.id !== 'auto') applyLocationToView(view, loc)
   })
+  // Cosmetic ad filtering — re-inject on each document load (insertCSS is per-document)
+  view.webContents.on('dom-ready', () => applyCosmeticFilter(view))
   view.webContents.on('did-navigate-in-page', (_, navUrl) =>
-    sendToRenderer('tab-navigated', { tabId, url: navUrl })
+    sendToWindow(ws, 'tab-navigated', { tabId, url: navUrl })
   )
   view.webContents.on('page-title-updated', (_, title) =>
-    sendToRenderer('tab-title-updated', { tabId, title })
+    sendToWindow(ws, 'tab-title-updated', { tabId, title })
   )
   view.webContents.on('page-favicon-updated', (_, favicons) =>
-    sendToRenderer('tab-favicon-updated', { tabId, favicon: favicons[0] || null })
+    sendToWindow(ws, 'tab-favicon-updated', { tabId, favicon: favicons[0] || null })
   )
   view.webContents.on('did-start-loading', () =>
-    sendToRenderer('tab-loading', { tabId, loading: true })
+    sendToWindow(ws, 'tab-loading', { tabId, loading: true })
   )
   view.webContents.on('did-stop-loading', () => {
-    sendToRenderer('tab-loading', { tabId, loading: false })
-    sendToRenderer('tab-nav-state', {
+    sendToWindow(ws, 'tab-loading', { tabId, loading: false })
+    sendToWindow(ws, 'tab-nav-state', {
       tabId,
       canGoBack: view.webContents.canGoBack(),
       canGoForward: view.webContents.canGoForward(),
     })
   })
 
-  browserViews.set(tabId, view)
+  ws.browserViews.set(tabId, view)
   // Keyboard/mouse input inside the BrowserView resets the idle timer
   view.webContents.on('before-input-event', () => resetActivity())
   setupAntiFingerprint(view)  // inject fingerprint protection before first page load
   if (url && url !== 'about:blank') view.webContents.loadURL(sanitizeURL(url))
 
-  setupContextMenu(view, tabId)
+  setupContextMenu(ws, view, tabId)
   return view
 }
 
 // ─── Context menu for BrowserViews ────────────────────────────────────────────
-function openInNewTab(url, switchTo = true, incognito = false) {
+function openInNewTab(ws, url, switchTo = true, incognito = false) {
   const newTabId = `tab_${Date.now()}`
-  createBrowserView(newTabId, url, { incognito })
-  if (switchTo) showTab(newTabId)
-  sendToRenderer('tab-created', { tabId: newTabId, url, incognito, switchTo })
+  createBrowserView(ws, newTabId, url, { incognito })
+  if (switchTo) showTab(ws, newTabId)
+  sendToWindow(ws, 'tab-created', { tabId: newTabId, url, incognito, switchTo })
 }
 
-function setupContextMenu(view, tabId) {
+function setupContextMenu(ws, view, tabId) {
   view.webContents.on('context-menu', (_, params) => {
     const sections = []
 
     // Link actions
     if (params.linkURL) {
       sections.push([
-        { label: 'Open Link in New Tab', click: () => openInNewTab(params.linkURL, true, incognitoTabs.has(tabId)) },
-        { label: 'Open Link in Background Tab', click: () => openInNewTab(params.linkURL, false, incognitoTabs.has(tabId)) },
+        { label: 'Open Link in New Tab', click: () => openInNewTab(ws, params.linkURL, true, incognitoTabs.has(tabId)) },
+        { label: 'Open Link in Background Tab', click: () => openInNewTab(ws, params.linkURL, false, incognitoTabs.has(tabId)) },
         { label: 'Copy Link Address', click: () => clipboard.writeText(params.linkURL) },
       ])
     }
@@ -477,7 +546,7 @@ function setupContextMenu(view, tabId) {
     // Image actions
     if (params.mediaType === 'image' && params.srcURL) {
       sections.push([
-        { label: 'Open Image in New Tab', click: () => openInNewTab(params.srcURL, true, incognitoTabs.has(tabId)) },
+        { label: 'Open Image in New Tab', click: () => openInNewTab(ws, params.srcURL, true, incognitoTabs.has(tabId)) },
         { label: 'Save Image As…', click: () => view.webContents.downloadURL(params.srcURL) },
         { label: 'Copy Image Address', click: () => clipboard.writeText(params.srcURL) },
       ])
@@ -500,6 +569,7 @@ function setupContextMenu(view, tabId) {
         {
           label: `Search for "${label}"`,
           click: () => openInNewTab(
+            ws,
             `https://www.google.com/search?q=${encodeURIComponent(params.selectionText.trim())}`,
             true,
             incognitoTabs.has(tabId)
@@ -518,7 +588,7 @@ function setupContextMenu(view, tabId) {
     // Page actions
     sections.push([
       { label: 'Save Page As…', click: () => view.webContents.downloadURL(params.pageURL) },
-      { label: 'View Page Source', click: () => openInNewTab(`view-source:${params.pageURL}`, true) },
+      { label: 'View Page Source', click: () => openInNewTab(ws, `view-source:${params.pageURL}`, true) },
     ])
 
     // Developer tools (dev only)
@@ -535,7 +605,7 @@ function setupContextMenu(view, tabId) {
       template.push(...section)
     })
 
-    if (template.length) Menu.buildFromTemplate(template).popup({ window: mainWindow })
+    if (template.length) Menu.buildFromTemplate(template).popup({ window: ws.win })
   })
 }
 
@@ -548,18 +618,12 @@ function sanitizeURL(input) {
   return `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`
 }
 
-function showTab(tabId) {
+function showTab(ws, tabId) {
   // Detach every view first — only one is ever in the window at a time.
-  browserViews.forEach((view) => mainWindow.removeBrowserView(view))
-  activeTabId = tabId
-  const view = browserViews.get(tabId)
-  if (view) layoutBrowserView(view)
-}
-
-function sendToRenderer(channel, payload) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(channel, payload)
-  }
+  ws.browserViews.forEach(view => ws.win.removeBrowserView(view))
+  ws.activeTabId = tabId
+  const view = ws.browserViews.get(tabId)
+  if (view) layoutBrowserView(ws, view)
 }
 
 // ─── History ───────────────────────────────────────────────────────────────────
@@ -576,74 +640,87 @@ function addHistory(url, title, tabId) {
 }
 
 // ─── IPC: Tab management ───────────────────────────────────────────────────────
-ipcMain.handle('tab-create', requireUnlocked((_, { url, background = false } = {}) => {
+ipcMain.handle('tab-create', requireUnlocked((event, { url, background = false } = {}) => {
+  const ws = getWS(event.sender)
+  if (!ws) return
   const tabId = `tab_${Date.now()}`
-  createBrowserView(tabId, url)
-  if (!background) showTab(tabId)
+  createBrowserView(ws, tabId, url)
+  if (!background) showTab(ws, tabId)
   return tabId
 }))
 
-ipcMain.handle('tab-create-incognito', requireUnlocked((_, { url } = {}) => {
+ipcMain.handle('tab-create-incognito', requireUnlocked((event, { url } = {}) => {
+  const ws = getWS(event.sender)
+  if (!ws) return
   const tabId = `tab_incognito_${Date.now()}`
-  createBrowserView(tabId, url, { incognito: true })
-  showTab(tabId)
+  createBrowserView(ws, tabId, url, { incognito: true })
+  showTab(ws, tabId)
   return tabId
 }))
 
-ipcMain.handle('tab-close', requireUnlocked((_, { tabId }) => {
-  const view = browserViews.get(tabId)
+ipcMain.handle('tab-close', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  if (!ws) return
+  const view = ws.browserViews.get(tabId)
   if (view) {
-    mainWindow.removeBrowserView(view)
+    ws.win.removeBrowserView(view)
     view.webContents.destroy()
-    browserViews.delete(tabId)
+    ws.browserViews.delete(tabId)
     incognitoTabs.delete(tabId)
-    trackerStats.delete(tabId)
+    ws.trackerStats.delete(tabId)
+    ws.adStats.delete(tabId)
   }
 }))
 
-ipcMain.handle('tab-switch', requireUnlocked((_, { tabId }) => {
-  if (browserViews.has(tabId)) showTab(tabId)
+ipcMain.handle('tab-switch', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  if (ws && ws.browserViews.has(tabId)) showTab(ws, tabId)
 }))
 
-ipcMain.handle('tab-navigate', requireUnlocked((_, { tabId, url }) => {
-  const view = browserViews.get(tabId)
+ipcMain.handle('tab-navigate', requireUnlocked((event, { tabId, url }) => {
+  const ws = getWS(event.sender)
+  if (!ws) return
+  const view = ws.browserViews.get(tabId)
   if (view) {
     const safe = sanitizeURL(url)
     // Attach view immediately (may currently be detached for about:blank) so the
     // blank→loading→content transition plays in the BrowserView, not as the React
     // new-tab page disappearing mid-flight.
-    if (tabId === activeTabId && !overlayActive && !mainWindow.getBrowserViews().includes(view)) {
-      mainWindow.addBrowserView(view)
-      const [w, h] = mainWindow.getContentSize()
-      view.setBounds({ x: 0, y: chromeHeight, width: w, height: Math.max(1, h - chromeHeight) })
+    if (tabId === ws.activeTabId && !ws.overlayActive && !ws.win.getBrowserViews().includes(view)) {
+      ws.win.addBrowserView(view)
+      const [w, h] = ws.win.getContentSize()
+      view.setBounds({ x: 0, y: ws.chromeHeight, width: w, height: Math.max(1, h - ws.chromeHeight) })
     }
     view.webContents.loadURL(safe)
     return safe
   }
 }))
 
-ipcMain.handle('tab-go-back', requireUnlocked((_, { tabId }) => {
-  const view = browserViews.get(tabId)
+ipcMain.handle('tab-go-back', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  const view = ws?.browserViews.get(tabId)
   if (view && view.webContents.canGoBack()) view.webContents.goBack()
 }))
 
-ipcMain.handle('tab-go-forward', requireUnlocked((_, { tabId }) => {
-  const view = browserViews.get(tabId)
+ipcMain.handle('tab-go-forward', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  const view = ws?.browserViews.get(tabId)
   if (view && view.webContents.canGoForward()) view.webContents.goForward()
 }))
 
-ipcMain.handle('tab-reload', requireUnlocked((_, { tabId }) => {
-  const view = browserViews.get(tabId)
-  if (view) view.webContents.reload()
+ipcMain.handle('tab-reload', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  ws?.browserViews.get(tabId)?.webContents.reload()
 }))
 
-ipcMain.handle('tab-stop', requireUnlocked((_, { tabId }) => {
-  const view = browserViews.get(tabId)
-  if (view) view.webContents.stop()
+ipcMain.handle('tab-stop', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  ws?.browserViews.get(tabId)?.webContents.stop()
 }))
 
-ipcMain.handle('tab-get-url', requireUnlocked((_, { tabId }) => {
-  const view = browserViews.get(tabId)
+ipcMain.handle('tab-get-url', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  const view = ws?.browserViews.get(tabId)
   return view ? view.webContents.getURL() : ''
 }))
 
@@ -691,7 +768,7 @@ ipcMain.handle('privacy-get', requireUnlocked(() => privacy.getSettings()))
 
 ipcMain.handle('privacy-save', requireUnlocked((_, patch) => {
   // Only persist known setting keys — reject arbitrary renderer-supplied keys
-  const ALLOWED_KEYS = ['doNotTrack', 'globalPrivacyControl', 'blockTrackers', 'httpsOnly', 'blockThirdPartyCookies']
+  const ALLOWED_KEYS = ['doNotTrack', 'globalPrivacyControl', 'blockTrackers', 'blockAds', 'httpsOnly', 'blockThirdPartyCookies']
   const safePatch = {}
   for (const key of ALLOWED_KEYS) {
     if (key in patch && typeof patch[key] === 'boolean') safePatch[key] = patch[key]
@@ -699,6 +776,15 @@ ipcMain.handle('privacy-save', requireUnlocked((_, patch) => {
   const updated = privacy.saveSettings(safePatch)
   // Re-apply third-party cookie setting to default session
   applyThirdPartyCookies(session.defaultSession, updated.blockThirdPartyCookies)
+  // Live-apply cosmetic ad filtering to every open view (no reload needed)
+  if ('blockAds' in safePatch) {
+    for (const ws of windowStates.values()) {
+      for (const view of ws.browserViews.values()) {
+        if (updated.blockAds) applyCosmeticFilter(view)
+        else removeCosmeticFilter(view)
+      }
+    }
+  }
   return updated
 }))
 
@@ -758,7 +844,16 @@ ipcMain.handle('download-show', requireUnlocked((_, { savePath }) => {
 }))
 
 // ─── IPC: Tracker stats ────────────────────────────────────────────────────────
-ipcMain.handle('tracker-stats-get', requireUnlocked((_, { tabId }) => trackerStats.get(tabId) || 0))
+ipcMain.handle('tracker-stats-get', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  return ws?.trackerStats.get(tabId) || 0
+}))
+
+// ─── IPC: Ad stats ─────────────────────────────────────────────────────────────
+ipcMain.handle('ad-stats-get', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  return ws?.adStats.get(tabId) || 0
+}))
 
 // ─── IPC: Session persistence ─────────────────────────────────────────────────
 ipcMain.handle('session-get', requireUnlocked(() => store.get('lastSession', null)))
@@ -785,31 +880,37 @@ ipcMain.handle('shortcuts-set', requireUnlocked((_, shortcuts) => {
 }))
 
 // ─── IPC: Overlay (hide BrowserView so React panels render over it) ────────────
-ipcMain.handle('overlay-open', requireUnlocked(() => {
-  overlayActive = true
-  if (activeTabId && browserViews.has(activeTabId)) {
-    mainWindow.removeBrowserView(browserViews.get(activeTabId))
+ipcMain.handle('overlay-open', requireUnlocked((event) => {
+  const ws = getWS(event.sender)
+  if (!ws) return
+  ws.overlayActive = true
+  if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
+    ws.win.removeBrowserView(ws.browserViews.get(ws.activeTabId))
   }
 }))
 
-ipcMain.handle('overlay-close', requireUnlocked(() => {
-  overlayActive = false
-  if (activeTabId && browserViews.has(activeTabId)) {
-    layoutBrowserView(browserViews.get(activeTabId))
+ipcMain.handle('overlay-close', requireUnlocked((event) => {
+  const ws = getWS(event.sender)
+  if (!ws) return
+  ws.overlayActive = false
+  if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
+    layoutBrowserView(ws, ws.browserViews.get(ws.activeTabId))
   }
 }))
 
 // ─── IPC: Chrome height (renderer → main so BrowserView is positioned correctly) ──
-ipcMain.on('set-chrome-height', (_, cssHeight) => {
+ipcMain.on('set-chrome-height', (event, cssHeight) => {
   if (typeof cssHeight !== 'number' || cssHeight <= 0 || cssHeight > 300) return
-  chromeHeight = Math.ceil(cssHeight)
+  const ws = getWS(event.sender)
+  if (!ws) return
+  ws.chromeHeight = Math.ceil(cssHeight)
   // Debounce layout updates — rapid calls (e.g. from ResizeObserver) would otherwise
   // trigger setBounds while Blink is still processing the previous layout, causing
   // "Message rejected by blink.mojom.WidgetHost" IPC errors.
-  clearTimeout(chromeHeightTimer)
-  chromeHeightTimer = setTimeout(() => {
-    if (activeTabId && browserViews.has(activeTabId)) {
-      layoutBrowserView(browserViews.get(activeTabId))
+  clearTimeout(ws.chromeHeightTimer)
+  ws.chromeHeightTimer = setTimeout(() => {
+    if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
+      layoutBrowserView(ws, ws.browserViews.get(ws.activeTabId))
     }
   }, 50)
 })
@@ -835,7 +936,37 @@ async function applyLocationToView(view, loc) {
   }
 }
 
-// ─── Anti-fingerprinting injection via Chrome DevTools Protocol ───────────────
+// ─── Cosmetic ad filtering ───────────────────────────────────────────────────
+// Hides leftover ad containers whose network requests were already blocked, so
+// pages don't show empty gaps or collapsed placeholders. CSS is injected per
+// document (cleared on navigation) and tracked by key so it can be removed live
+// when the user disables ad blocking without requiring a reload.
+async function applyCosmeticFilter(view) {
+  if (!view || view.webContents.isDestroyed()) return
+  if (!privacy.getSettings().blockAds) { await removeCosmeticFilter(view); return }
+  if (view._cosmeticKey) return // already applied to current document
+  // Per-site element-hiding rules + scriptlets from the ads filter engine
+  // (falls back to the static selector CSS until the engine has loaded).
+  const { styles, scripts } = filterEngine.getCosmetics(view.webContents.getURL())
+  try {
+    if (styles) view._cosmeticKey = await view.webContents.insertCSS(styles)
+  } catch { /* document may have navigated away mid-insert */ }
+  // Scriptlets (anti-adblock defusing, element removal, etc.) — injected once per
+  // document. Best-effort: page CSP or a mid-flight navigation may reject them.
+  if (scripts.length) {
+    try { await view.webContents.executeJavaScript(scripts.join('\n'), true) } catch {}
+  }
+}
+
+async function removeCosmeticFilter(view) {
+  if (!view || view.webContents.isDestroyed() || !view._cosmeticKey) return
+  try {
+    await view.webContents.removeInsertedCSS(view._cosmeticKey)
+  } catch { /* key already invalidated by navigation */ }
+  view._cosmeticKey = null
+}
+
+
 // Registers a script that runs at document-start in every page context, before
 // any page JS. Survives cross-origin navigations because the registration lives
 // on the webContents (not the renderer process).
@@ -868,8 +999,10 @@ ipcMain.handle('location-set', requireUnlocked(async (_, loc) => {
     ? { id: String(loc.id || 'custom').slice(0, 64), lat: loc.lat, lng: loc.lng, label: String(loc.label || '').slice(0, 128) }
     : null
   store.set('location', safeLoc)
-  for (const view of browserViews.values()) {
-    await applyLocationToView(view, safeLoc)
+  for (const ws of windowStates.values()) {
+    for (const view of ws.browserViews.values()) {
+      await applyLocationToView(view, safeLoc)
+    }
   }
   return safeLoc
 }))
@@ -895,6 +1028,8 @@ function buildMenu() {
     {
       label: 'File',
       submenu: [
+        { label: 'New Window', accelerator: 'CmdOrCtrl+N', click: () => createWindow() },
+        { type: 'separator' },
         { label: 'New Tab', accelerator: 'CmdOrCtrl+T', click: () => sendToRenderer('menu-new-tab', {}) },
         { label: 'New Incognito Tab', accelerator: 'CmdOrCtrl+Shift+N', click: () => sendToRenderer('menu-new-incognito', {}) },
         { label: 'Close Tab', accelerator: 'CmdOrCtrl+W', click: () => sendToRenderer('menu-close-tab', {}) },
@@ -910,8 +1045,9 @@ function buildMenu() {
         { type: 'separator' },
         { role: 'togglefullscreen' },
         { label: 'Toggle DevTools', accelerator: 'F12', click: () => {
-          const view = browserViews.get(activeTabId)
-          if (view) view.webContents.toggleDevTools()
+          const focusedWin = BrowserWindow.getFocusedWindow()
+          const ws = focusedWin ? windowStates.get(focusedWin.id) : null
+          if (ws) ws.browserViews.get(ws.activeTabId)?.webContents.toggleDevTools()
         }},
       ],
     },
@@ -960,7 +1096,6 @@ ipcMain.handle('app-auth', async (_, { reason } = {}) => {
   if (process.platform !== 'darwin') {
     store.delete('failedAuthAttempts')
     isAppLocked = false
-    overlayActive = false
     resetActivity()
     return { success: true, attemptsLeft: MAX_AUTH_ATTEMPTS }
   }
@@ -971,7 +1106,6 @@ ipcMain.handle('app-auth', async (_, { reason } = {}) => {
     await systemPreferences.promptTouchID('unlock ServeSafe Browser')
     store.delete('failedAuthAttempts')
     isAppLocked = false
-    overlayActive = false
     resetActivity()
     return { success: true, attemptsLeft: MAX_AUTH_ATTEMPTS }
   } catch (err) {
@@ -993,6 +1127,7 @@ ipcMain.handle('app-auth', async (_, { reason } = {}) => {
 ipcMain.handle('app-auth-state', () => ({
   attemptsLeft: Math.max(0, MAX_AUTH_ATTEMPTS - store.get('failedAuthAttempts', 0)),
   appLockEnabled: store.get('appLockEnabled', true),
+  isLocked: isAppLocked,
 }))
 
 ipcMain.handle('app-lock-enabled-get', () => store.get('appLockEnabled', true))
@@ -1003,7 +1138,6 @@ ipcMain.handle('app-lock-enabled-set', (_, enabled) => {
   if (!enabled) {
     // Disabling lock — immediately unlock and clear failed-attempt counter
     isAppLocked = false
-    overlayActive = false
     store.delete('failedAuthAttempts')
   }
   return enabled
@@ -1052,18 +1186,23 @@ app.whenReady().then(async () => {
     if (minutes === 0) return  // 0 = disabled
     if (Date.now() - lastActivity >= minutes * 60_000) {
       isAppLocked = true
-      // Hide the active BrowserView — without this the web page stays visible
-      // on top of the React lock screen (BrowserView is a native overlay).
-      overlayActive = true
-      if (activeTabId && mainWindow && browserViews.has(activeTabId)) {
-        mainWindow.removeBrowserView(browserViews.get(activeTabId))
+      // Hide active BrowserView in every window so the lock screen is visible.
+      for (const ws of windowStates.values()) {
+        ws.overlayActive = true
+        if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
+          ws.win.removeBrowserView(ws.browserViews.get(ws.activeTabId))
+        }
+        sendToWindow(ws, 'lock-app', {})
       }
-      sendToRenderer('lock-app', {})
     }
   }, 30_000)
 
   // Set up default session once
   setupSession(session.defaultSession)
+
+  // Load the ad/tracker filter engines (cache-first; builds in the background).
+  // Non-blocking: request filtering falls back to the static lists until ready.
+  filterEngine.init()
 
   // Apply initial third-party cookie setting
   const settings = privacy.getSettings()

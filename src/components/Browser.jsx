@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useDeferredValue } from 'react'
+import React, { useState, useEffect, useRef, useDeferredValue, useCallback, useLayoutEffect } from 'react'
 import { useT } from '../LanguageContext.jsx'
 import {
   GlobeIcon, LockIcon, AlertTriangleIcon, AlertOctagonIcon,
@@ -15,11 +15,36 @@ const DEFAULT_SHORTCUTS = [
 ]
 
 // ─── Tab Item (memoized — only re-renders when its own data or active state changes) ──
-const TabItem = React.memo(function TabItem({ tab, isActive, onSwitch, onClose }) {
+const TabItem = React.memo(function TabItem({ tab, isActive, onSwitch, onClose, onMove, dragRef, tabRef }) {
+  const [dragOver, setDragOver] = useState(false)
   const t = useT()
   return (
     <div
-      className={`tab ${isActive ? 'active' : ''} ${tab.incognito ? 'is-incognito' : ''}`}
+      ref={tabRef}
+      className={`tab ${isActive ? 'active' : ''} ${tab.incognito ? 'is-incognito' : ''} ${dragOver ? 'drag-over' : ''}`}
+      draggable
+      onDragStart={e => {
+        dragRef.current = tab.id
+        e.dataTransfer.effectAllowed = 'move'
+      }}
+      onDragOver={e => {
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'move'
+        setDragOver(true)
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={e => {
+        e.preventDefault()
+        setDragOver(false)
+        if (dragRef.current && dragRef.current !== tab.id) {
+          onMove(dragRef.current, tab.id)
+        }
+        dragRef.current = null
+      }}
+      onDragEnd={() => {
+        setDragOver(false)
+        dragRef.current = null
+      }}
       onClick={() => onSwitch(tab.id)}
       title={tab.title || tab.url}
     >
@@ -31,7 +56,7 @@ const TabItem = React.memo(function TabItem({ tab, isActive, onSwitch, onClose }
             ? <EyeOffIcon size={16} className="tab-favicon" />
             : <GlobeIcon size={16} className="tab-favicon" />
       }
-      <span className="tab-title">{tab.incognito ? `(${t.incognitoPrefix}) ` : ''}{tab.title || t.newTab}</span>
+      <span className="tab-title">{tab.title || t.newTab}</span>
       <button
         className="tab-close"
         onClick={e => { e.stopPropagation(); onClose(tab.id) }}
@@ -39,30 +64,138 @@ const TabItem = React.memo(function TabItem({ tab, isActive, onSwitch, onClose }
       ><XIcon size={10} /></button>
     </div>
   )
-}, (prev, next) => prev.tab === next.tab && prev.isActive === next.isActive)
+}, (prev, next) => prev.tab === next.tab && prev.isActive === next.isActive && prev.onMove === next.onMove)
 
-// ─── Tab Bar (memoized — only re-renders when tabs array or activeId reference changes) ──
-export const TabBar = React.memo(function TabBar({ tabs, activeId, onSwitch, onClose, onNew, onNewIncognito }) {
+// ─── Tab Bar ──────────────────────────────────────────────────────────────────
+export const TabBar = React.memo(function TabBar({ tabs, activeId, onSwitch, onClose, onNew, onNewIncognito, onMove, onOverlayOpen, onOverlayClose }) {
   const t = useT()
+  const dragRef = useRef(null)
+  const barRef = useRef(null)
+  const actionsRef = useRef(null)
+  const tabRefs = useRef({}) // { [id]: HTMLElement }
+  const [overflowStart, setOverflowStart] = useState(Infinity)
+  const [showMenu, setShowMenu] = useState(false)
+
+  const compute = useCallback(() => {
+    const bar = barRef.current
+    if (!bar) return
+
+    // Padding reserved by CSS (macOS traffic lights + right padding)
+    const PADDING = 80 + 8
+    const actionsW = actionsRef.current?.offsetWidth ?? 62
+    const MORE_BTN = 38 // "▾ N" button
+    const totalForTabs = bar.clientWidth - PADDING - actionsW
+
+    const fit = (limit) => {
+      let used = 0
+      for (let i = 0; i < tabs.length; i++) {
+        const el = tabRefs.current[tabs[i].id]
+        const w = (el instanceof HTMLElement ? el.offsetWidth : 120) + 2 // +2 gap
+        if (used + w > limit) return i
+        used += w
+      }
+      return Infinity
+    }
+
+    // First pass: do all tabs fit without a "more" button?
+    if (fit(totalForTabs) === Infinity) {
+      setOverflowStart(Infinity)
+      return
+    }
+    // Second pass: reserve space for the "more" button
+    const c = fit(totalForTabs - MORE_BTN)
+    setOverflowStart(Math.max(1, c === Infinity ? tabs.length : c))
+  }, [tabs])
+
+  useLayoutEffect(() => {
+    const bar = barRef.current
+    if (!bar) return
+    compute()
+    const ro = new ResizeObserver(compute)
+    ro.observe(bar)
+    return () => ro.disconnect()
+  }, [compute])
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    if (!showMenu) return
+    const close = () => setShowMenu(false)
+    document.addEventListener('click', close, { once: true })
+    return () => document.removeEventListener('click', close)
+  }, [showMenu])
+
+  // Hide BrowserView while dropdown is open (it sits on top natively in Electron)
+  useEffect(() => {
+    if (!showMenu) return
+    onOverlayOpen?.()
+    return () => onOverlayClose?.()
+  }, [showMenu, onOverlayOpen, onOverlayClose])
+
+  const visibleTabs = overflowStart === Infinity ? tabs : tabs.slice(0, overflowStart)
+  const overflowTabs = overflowStart === Infinity ? [] : tabs.slice(overflowStart)
+  const hasActiveInOverflow = overflowTabs.some(tab => tab.id === activeId)
+
   return (
-    <div className="tab-bar">
-      {tabs.map(tab => (
+    <div className="tab-bar" ref={barRef}>
+      {visibleTabs.map(tab => (
         <TabItem
           key={tab.id}
           tab={tab}
           isActive={tab.id === activeId}
           onSwitch={onSwitch}
           onClose={onClose}
+          onMove={onMove}
+          dragRef={dragRef}
+          tabRef={el => { tabRefs.current[tab.id] = el }}
         />
       ))}
-      <button className="new-tab-btn" onClick={onNew} title={t.newTabBtnTitle}><PlusIcon size={16} /></button>
-      <button className="new-tab-btn incognito-btn" onClick={onNewIncognito} title={t.newIncognitoTabTitle}><EyeOffIcon size={14} /></button>
+
+      {overflowTabs.length > 0 && (
+        <div className="tab-overflow-wrap" onClick={e => e.stopPropagation()}>
+          <button
+            className={`tab-overflow-btn${hasActiveInOverflow ? ' has-active' : ''}`}
+            onClick={() => setShowMenu(v => !v)}
+            title={t.moreTabsTitle ?? 'More tabs'}
+          >
+            ▾ {overflowTabs.length}
+          </button>
+          {showMenu && (
+            <div className="tab-overflow-dropdown">
+              {overflowTabs.map(tab => (
+                <div
+                  key={tab.id}
+                  className={`tab-overflow-item${tab.id === activeId ? ' active' : ''}`}
+                  onClick={() => { onSwitch(tab.id); setShowMenu(false) }}
+                >
+                  {tab.favicon
+                    ? <img className="tab-overflow-favicon" src={tab.favicon} alt="" onError={e => (e.target.style.display = 'none')} />
+                    : tab.incognito
+                      ? <EyeOffIcon size={14} />
+                      : <GlobeIcon size={14} />
+                  }
+                  <span className="tab-overflow-title">{tab.title || t.newTab}</span>
+                  <button
+                    className="tab-close"
+                    onClick={e => { e.stopPropagation(); onClose(tab.id) }}
+                    title={t.closeTabTitle}
+                  ><XIcon size={10} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div ref={actionsRef} className="tab-bar-actions">
+        <button className="new-tab-btn" onClick={onNew} title={t.newTabBtnTitle}><PlusIcon size={16} /></button>
+        <button className="new-tab-btn incognito-btn" onClick={onNewIncognito} title={t.newIncognitoTabTitle}><EyeOffIcon size={14} /></button>
+      </div>
     </div>
   )
 })
 
 // ─── Security Badge ───────────────────────────────────────────────────────────
-function SecurityBadge({ url, hasCertError, trackerCount, onToggle }) {
+function SecurityBadge({ url, hasCertError, trackerCount, adCount, onToggle }) {
   const t = useT()
   const isSecure = url && url.startsWith('https://')
   const isInsecure = url && url.startsWith('http://') && !url.startsWith('http://localhost')
@@ -78,11 +211,13 @@ function SecurityBadge({ url, hasCertError, trackerCount, onToggle }) {
     icon = <GlobeIcon size={14} />; cls = ''; title = t.noPage
   }
 
+  const blockedCount = (trackerCount || 0) + (adCount || 0)
+
   return (
     <div className="security-badge-wrap">
       <button className={`security-icon-btn ${cls}`} onClick={onToggle} title={title}>
         {icon}
-        {trackerCount > 0 && <span className="tracker-badge">{trackerCount}</span>}
+        {blockedCount > 0 && <span className="tracker-badge">{blockedCount}</span>}
       </button>
     </div>
   )
@@ -91,7 +226,7 @@ function SecurityBadge({ url, hasCertError, trackerCount, onToggle }) {
 // ─── Address Bar ──────────────────────────────────────────────────────────────
 export function AddressBar({
   url, loading, canGoBack, canGoForward,
-  isBookmarked, hasCertError, trackerCount,
+  isBookmarked, hasCertError, trackerCount, adCount,
   onNavigate, onBack, onForward, onReload, onStop,
   onBookmark, onOpenHistory, onOpenBookmarks, onOpenPrivacy, onOpenSettings,
 }) {
@@ -150,6 +285,7 @@ export function AddressBar({
           url={url}
           hasCertError={hasCertError}
           trackerCount={trackerCount}
+          adCount={adCount}
           onToggle={(e) => { e.stopPropagation(); setShowSecurityPopover(v => !v) }}
         />
 
@@ -160,6 +296,7 @@ export function AddressBar({
             {!hasCertError && !isSecure && <div className="popover-row warn">{t.connectionNotEncrypted}</div>}
             {certIssuerLine && <div className="popover-row muted">{t.siteLabel}: {certIssuerLine}</div>}
             {trackerCount > 0 && <div className="popover-row">{t.trackersBlocked(trackerCount)}</div>}
+            {adCount > 0 && <div className="popover-row">{t.adsBlocked(adCount)}</div>}
           </div>
         )}
 
