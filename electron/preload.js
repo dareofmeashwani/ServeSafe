@@ -8,7 +8,7 @@ const ALLOWED_EVENTS = [
   'menu-new-incognito',
   // Security / privacy
   'cert-error', 'permission-request',
-  'https-only-blocked', 'tracker-blocked', 'ad-blocked',
+  'https-only-blocked', 'tracker-blocked', 'ad-blocked', 'cryptomining-blocked',
   // Downloads
   'download-started', 'download-updated', 'download-done',
   // App lock
@@ -53,6 +53,10 @@ contextBridge.exposeInMainWorld('browser', {
     ipcRenderer.invoke('permission-response', { id, allow, origin, permission }),
   getPermissions: () => ipcRenderer.invoke('permissions-get'),
   clearPermissions: () => ipcRenderer.invoke('permissions-clear'),
+  getPermissionDefaults: () => ipcRenderer.invoke('permission-defaults-get'),
+  setPermissionDefaults: (patch) => ipcRenderer.invoke('permission-defaults-set', patch),
+  setPermission: (origin, type, allow) => ipcRenderer.invoke('permission-set', { origin, type, allow }),
+  removePermission: (origin, type) => ipcRenderer.invoke('permission-remove', { origin, type }),
 
   // ── Downloads ────────────────────────────────────────────────────────────
   getDownloads: () => ipcRenderer.invoke('downloads-get'),
@@ -64,6 +68,9 @@ contextBridge.exposeInMainWorld('browser', {
 
   // ── Ad stats ──────────────────────────────────────────────────────────────
   getAdStats: (tabId) => ipcRenderer.invoke('ad-stats-get', { tabId }),
+
+  // ── Cryptomining stats ────────────────────────────────────────────────────
+  getCryptoMiningStats: (tabId) => ipcRenderer.invoke('cryptomining-stats-get', { tabId }),
 
   // ── Chrome height reporting (renderer → main for correct BrowserView layout) ──
   setChromeHeight: (cssHeight) => ipcRenderer.send('set-chrome-height', cssHeight),

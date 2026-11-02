@@ -9,6 +9,12 @@ const DEFAULT_SETTINGS = {
   blockAds: true,
   httpsOnly: false,
   blockThirdPartyCookies: true,
+  blockJavaScript: false,
+  blockDownloads: false,
+  blockCryptoMining: true,
+  antiFingerprinting: true,
+  secureDns: true,
+  blockBounceTracking: true,
 }
 
 function getSettings() {

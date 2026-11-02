@@ -31,6 +31,7 @@ const {
 } = require('@ghostery/adblocker-electron')
 const { isAd, AD_COSMETIC_CSS } = require('./adData')
 const { isTracker } = require('./trackerData')
+const { isCryptoMiner } = require('./cryptoMinerData')
 
 // Rebuild the cached engine if it's older than this (background refresh).
 const REFRESH_MS = 5 * 24 * 60 * 60 * 1000 // 5 days
@@ -137,6 +138,12 @@ function matchTrackers(details) {
   }
 }
 
+// Cryptomining uses the static domain list only (no dedicated engine needed;
+// miner domains change far less frequently than ad/tracker lists).
+function matchCryptoMiner(details) {
+  return isCryptoMiner(details.url)
+}
+
 // Cosmetic (element-hiding) rules + scriptlets for a page URL, from the ads engine.
 // Falls back to the static selector CSS until the engine is ready.
 function getCosmetics(frameUrl) {
@@ -154,4 +161,4 @@ function getCosmetics(frameUrl) {
   }
 }
 
-module.exports = { init, matchAds, matchTrackers, getCosmetics }
+module.exports = { init, matchAds, matchTrackers, matchCryptoMiner, getCosmetics }

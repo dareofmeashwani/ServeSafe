@@ -11,7 +11,7 @@ function renderTemplate(template, vars) {
 }
 
 export function PermissionToast({ request, onAllow, onDeny }) {
-  const { id, origin, permission } = request
+  const { id, origin, permission, types } = request
   const t = useT()
 
   const PERMISSION_ICONS = {
@@ -29,8 +29,11 @@ export function PermissionToast({ request, onAllow, onDeny }) {
     midi: t.permMIDI, clipboard: t.permClipboard,
   }
 
-  const icon  = PERMISSION_ICONS[permission] || <ShieldIcon size={22} />
-  const label = PERMISSION_LABELS[permission] || t.permAccess
+  // A combined request (e.g. getUserMedia for camera + microphone) arrives with a
+  // `types` array — show every label (joined) and the icon of the first type.
+  const typeList = Array.isArray(types) && types.length ? types : [permission]
+  const icon  = PERMISSION_ICONS[typeList[0]] || <ShieldIcon size={22} />
+  const label = typeList.map(p => PERMISSION_LABELS[p]).filter(Boolean).join(` ${t.permAnd} `) || t.permAccess
 
   let displayOrigin = origin
   try { displayOrigin = new URL(origin).hostname } catch {}

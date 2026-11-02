@@ -31,7 +31,7 @@ const api = isBrowser ? {
   getBookmarks: () => Promise.resolve([]),
   addBookmark: () => Promise.resolve([]),
   removeBookmark: () => Promise.resolve([]),
-  getPrivacySettings: () => Promise.resolve({ doNotTrack: true, globalPrivacyControl: true, blockTrackers: true, httpsOnly: false, blockThirdPartyCookies: true }),
+  getPrivacySettings: () => Promise.resolve({ doNotTrack: true, globalPrivacyControl: true, blockTrackers: true, httpsOnly: false, blockThirdPartyCookies: true, blockJavaScript: false, blockDownloads: false, blockCryptoMining: true }),
   savePrivacySettings: (p) => Promise.resolve(p),
   clearData: () => Promise.resolve(),
   respondToCert: () => Promise.resolve(),
@@ -44,6 +44,7 @@ const api = isBrowser ? {
   showDownload: () => Promise.resolve(),
   getTrackerStats: () => Promise.resolve(0),
   getAdStats: () => Promise.resolve(0),
+  getCryptoMiningStats: () => Promise.resolve(0),
   getTheme: () => Promise.resolve('light'),
   overlayOpen: () => Promise.resolve(),
   overlayClose: () => Promise.resolve(),
@@ -126,6 +127,7 @@ function BrowserApp() {
   const [permissionRequest, setPermissionRequest] = useState(null) // { id, origin, permission }
   const [trackerCounts, setTrackerCounts] = useState({})           // { tabId: number }
   const [adCounts, setAdCounts] = useState({})                     // { tabId: number }
+  const [cryptoMiningCounts, setCryptoMiningCounts] = useState({}) // { tabId: number }
   const [httpsBlockedUrl, setHttpsBlockedUrl] = useState(null)
 
   // ── Downloads ────────────────────────────────────────────────────────────────
@@ -289,6 +291,9 @@ function BrowserApp() {
       api.on('ad-blocked', ({ tabId, count }) =>
         startTransition(() => setAdCounts(prev => ({ ...prev, [tabId]: count })))
       ),
+      api.on('cryptomining-blocked', ({ tabId, count }) =>
+        startTransition(() => setCryptoMiningCounts(prev => ({ ...prev, [tabId]: count })))
+      ),
 
       // Menu: tab actions (need activeId closure)
       api.on('menu-close-tab', () => setActiveId(id => { if (id) closeTab(id); return id })),
@@ -335,6 +340,7 @@ function BrowserApp() {
     setCertWarning(prev => prev?.tabId === id ? null : prev)
     setTrackerCounts(prev => { const n = { ...prev }; delete n[id]; return n })
     setAdCounts(prev => { const n = { ...prev }; delete n[id]; return n })
+    setCryptoMiningCounts(prev => { const n = { ...prev }; delete n[id]; return n })
   }, [activeId, openNewTab])
 
   const switchTab = useCallback(async (id) => {
@@ -422,6 +428,7 @@ function BrowserApp() {
   const hasCertError = certErrorTabs.has(activeId)
   const trackerCount = trackerCounts[activeId] || 0
   const adCount = adCounts[activeId] || 0
+  const cryptoMiningCount = cryptoMiningCounts[activeId] || 0
 
   return (
     <>
@@ -520,6 +527,7 @@ function BrowserApp() {
           activeTabId={activeId}
           trackerCount={trackerCount}
           adCount={adCount}
+          cryptoMiningCount={cryptoMiningCount}
         />
       )}
     </>

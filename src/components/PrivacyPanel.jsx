@@ -15,9 +15,10 @@ function Toggle({ on, onChange }) {
   )
 }
 
-export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount }) {
+export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount, cryptoMiningCount }) {
   const [settings, setSettings] = useState(null)
   const [permissions, setPermissions] = useState({})
+  const [permDefaults, setPermDefaults] = useState({})
   const [clearFlags, setClearFlags] = useState({ history: true, cookies: false, cache: false })
   const [clearDone, setClearDone] = useState(false)
   const [section, setSection] = useState('settings')
@@ -28,6 +29,7 @@ export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount }) {
   useEffect(() => {
     window.browser.getPrivacySettings().then(setSettings)
     window.browser.getPermissions().then(setPermissions)
+    window.browser.getPermissionDefaults?.().then(d => setPermDefaults(d || {}))
     window.browser.getAutoLockMinutes?.().then(m => setAutoLockMinutes(m ?? 5))
     window.browser.getAuthState?.().then(s => {
       if (s?.appLockEnabled !== undefined) setAppLockEnabled(s.appLockEnabled)
@@ -50,16 +52,47 @@ export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount }) {
     setPermissions({})
   }
 
+  const updateDefault = async (type, policy) => {
+    const updated = await window.browser.setPermissionDefaults({ [type]: policy })
+    setPermDefaults(updated || {})
+  }
+
+  const setSitePerm = async (origin, type, allow) => {
+    const updated = await window.browser.setPermission(origin, type, allow)
+    setPermissions(updated || {})
+  }
+
+  const resetSitePerm = async (origin, type) => {
+    const updated = await window.browser.removePermission(origin, type)
+    setPermissions(updated || {})
+  }
+
+  const hostOf = (origin) => { try { return new URL(origin).hostname } catch { return origin } }
+
   if (!settings) return null
 
   const toggleDefs = [
+    { key: 'antiFingerprinting',     label: t.antiFingerprinting,     desc: t.antiFingerprintingDesc },
+    { key: 'secureDns',             label: t.secureDns,              desc: t.secureDnsDesc },
+    { key: 'blockBounceTracking',   label: t.blockBounceTracking,    desc: t.blockBounceTrackingDesc },
     { key: 'blockAds',               label: t.blockAds,               desc: t.blockAdsDesc },
     { key: 'blockTrackers',          label: t.blockTrackers,          desc: t.blockTrackersDesc },
+    { key: 'blockCryptoMining',      label: t.blockCryptoMining,      desc: t.blockCryptoMiningDesc },
+    { key: 'blockJavaScript',        label: t.blockJavaScript,        desc: t.blockJavaScriptDesc },
+    { key: 'blockDownloads',         label: t.blockDownloads,         desc: t.blockDownloadsDesc },
     { key: 'doNotTrack',             label: t.doNotTrack,             desc: t.doNotTrackDesc },
     { key: 'globalPrivacyControl',   label: t.globalPrivacyControl,   desc: t.globalPrivacyControlDesc },
     { key: 'httpsOnly',              label: t.httpsOnly,              desc: t.httpsOnlyDesc },
     { key: 'blockThirdPartyCookies', label: t.blockThirdPartyCookies, desc: t.blockThirdPartyCookiesDesc },
   ]
+
+  // Managed permission types (must match PERMISSION_TYPES in electron/main.js) and
+  // their localized labels, shared by the defaults list and the per-site list.
+  const PERM_TYPES = ['camera', 'microphone', 'geolocation', 'notifications', 'clipboard', 'midi']
+  const PERM_LABELS = {
+    camera: t.permCamera, microphone: t.permMicrophone, geolocation: t.permLocation,
+    notifications: t.permNotifications, clipboard: t.permClipboard, midi: t.permMIDI,
+  }
 
   const permEntries = Object.entries(permissions).flatMap(([origin, perms]) =>
     Object.entries(perms).map(([perm, allowed]) => ({ origin, perm, allowed }))
@@ -92,6 +125,13 @@ export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount }) {
                 <div className="privacy-stat">
                   <span className="privacy-stat-num">{adCount}</span>
                   <span className="privacy-stat-label">{t.adsBlockedPage(adCount)}</span>
+                </div>
+              )}
+
+              {cryptoMiningCount > 0 && (
+                <div className="privacy-stat">
+                  <span className="privacy-stat-num">{cryptoMiningCount}</span>
+                  <span className="privacy-stat-label">{t.cryptoMinersBlockedPage(cryptoMiningCount)}</span>
                 </div>
               )}
 
@@ -171,14 +211,48 @@ export function PrivacyPanel({ onClose, activeTabId, trackerCount, adCount }) {
 
           {section === 'permissions' && (
             <>
+              {/* Global defaults applied to sites with no explicit choice */}
+              <div className="privacy-section-title">{t.permDefaultsTitle}</div>
+              {PERM_TYPES.map(type => (
+                <div key={type} className="privacy-toggle-row">
+                  <div className="privacy-toggle-text">
+                    <div className="privacy-toggle-label">{PERM_LABELS[type]}</div>
+                  </div>
+                  <select
+                    className="autolock-select"
+                    value={permDefaults[type] || 'ask'}
+                    onChange={e => updateDefault(type, e.target.value)}
+                  >
+                    <option value="ask">{t.permAsk}</option>
+                    <option value="allow">{t.allow}</option>
+                    <option value="block">{t.block}</option>
+                  </select>
+                </div>
+              ))}
+
+              {/* Per-site overrides */}
+              <div className="privacy-section-title">{t.permSitesTitle}</div>
               {permEntries.length === 0
                 ? <div className="panel-empty">{t.noSavedPermissions}</div>
                 : permEntries.map(({ origin, perm, allowed }, i) => (
-                    <div key={i} className="panel-item">
+                    <div key={i} className="privacy-toggle-row">
                       <span className="panel-item-icon">{allowed ? <CheckCircleIcon size={16} style={{ color: 'var(--safe)' }} /> : <SlashCircleIcon size={16} style={{ color: 'var(--danger)' }} />}</span>
-                      <div className="panel-item-text">
-                        <div className="panel-item-title">{origin}</div>
-                        <div className="panel-item-url">{perm}</div>
+                      <div className="privacy-toggle-text" style={{ flex: 1, minWidth: 0 }}>
+                        <div className="privacy-toggle-label" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{hostOf(origin)}</div>
+                        <div className="privacy-toggle-desc">{PERM_LABELS[perm] || perm}</div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <select
+                          className="autolock-select"
+                          value={allowed ? 'allow' : 'block'}
+                          onChange={e => setSitePerm(origin, perm, e.target.value === 'allow')}
+                        >
+                          <option value="allow">{t.allow}</option>
+                          <option value="block">{t.block}</option>
+                        </select>
+                        <button className="perm-reset-btn" title={t.permReset} onClick={() => resetSitePerm(origin, perm)}>
+                          <XIcon size={12} />
+                        </button>
                       </div>
                     </div>
                   ))

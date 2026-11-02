@@ -12,17 +12,15 @@ const {
   systemPreferences,
 } = require('electron')
 const path = require('path')
-const fs = require('fs')
 const storeKey = require('./storeKey')
 const security = require('./security')
 const privacy = require('./privacy')
 const filterEngine = require('./filterEngine')
+const fingerprint = require('./fingerprint')
+const bounceTracker = require('./bounceTracker')
 
 let store  // set to the encrypted electron-store instance in app.whenReady()
-const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged// Anti-fingerprinting script — loaded once, injected into every page via CDP
-const antiFingerprintScript = fs.readFileSync(
-  path.join(__dirname, 'antiFingerprint.js'), 'utf8'
-)
+const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 
 // ─── macOS GPU helper fix (development / unsigned builds) ─────────────────────
 // Without code-signing entitlements the separate GPU helper process can't get
@@ -36,6 +34,99 @@ if (process.platform === 'darwin' && !app.isPackaged) {
 // Prevent WebRTC from leaking the local LAN IP — only the public interface is used
 app.commandLine.appendSwitch('webrtc-ip-handling-policy', 'default_public_interface_only')
 
+// Enforce per-first-party-site isolation of client-side state. These Chromium
+// features partition a third party's storage, cookies, HTTP cache and network
+// state by the TOP-LEVEL site, so a tracker embedded on siteA.com and siteB.com
+// can no longer correlate a user across them via shared localStorage/cookies.
+// This is the non-breaking equivalent of Firefox's Total Cookie Protection and
+// is what Chrome itself ships by default; enabling explicitly pins the behavior.
+app.commandLine.appendSwitch('enable-features', [
+  'ThirdPartyStoragePartitioning',
+  'PartitionedCookies',
+  'PartitionConnectionsByNetworkIsolationKey',
+].join(','))
+
+// ─── Zero telemetry & data minimization ─────────────────────────────────────────
+// Strip every background "phone-home" Chromium performs by default so the browser
+// never reports your activity to Google or any developer endpoint — the LibreWolf /
+// Waterfox model. Electron itself sends no usage metrics and we never start the
+// crashReporter, so nothing is uploaded; these switches additionally silence the
+// Chromium subsystems that would otherwise make their own background requests.
+// They are a permanent hardening baseline: Chromium reads them at process start
+// (before app `ready`), so they can't be a runtime toggle.
+//
+//  • disable-background-networking — umbrella kill-switch for background requests:
+//    variations/field-trial seed fetches, GCM, captive-portal probes, etc.
+//  • disable-component-update      — no "component updater" pings to Google.
+//  • disable-domain-reliability    — no network-error beacons to Google.
+//  • disable-breakpad              — disable the crash handler's upload path.
+//  • no-pings                      — never send <a ping> hyperlink-audit pings.
+//  • disable-sync                  — no account sync traffic (unused anyway).
+//  • disable-field-trial-config    — no Google "variations" experiments.
+for (const sw of [
+  'disable-background-networking',
+  'disable-component-update',
+  'disable-domain-reliability',
+  'disable-breakpad',
+  'no-pings',
+  'disable-sync',
+  'disable-field-trial-config',
+]) app.commandLine.appendSwitch(sw)
+
+// Disable individual features that make their own calls to Google servers:
+//  • OptimizationHints / OptimizationGuideModelDownloading — periodic hint fetches.
+//  • AutofillServerCommunication — field-classification queries (local autofill still works).
+//  • MediaRouter / DialMediaRouteProvider — Cast discovery + background mDNS chatter.
+//  • Translate — sends page text to Google's translation API.
+//  • SegmentationPlatform / PrivacySandboxAdsAPIs / BrowsingTopics — behavioural
+//    profiling / ad-measurement that reports back to ad infrastructure.
+app.commandLine.appendSwitch('disable-features', [
+  'OptimizationHints',
+  'OptimizationGuideModelDownloading',
+  'AutofillServerCommunication',
+  'MediaRouter',
+  'DialMediaRouteProvider',
+  'Translate',
+  'SegmentationPlatform',
+  'PrivacySandboxAdsAPIs',
+  'BrowsingTopics',
+].join(','))
+
+// Belt-and-suspenders: hard-disable metrics/crash collection via env vars that
+// Chromium's metrics service and Crashpad honour, independent of the switches above.
+process.env.GOOGLE_API_KEY = 'no'
+process.env.GOOGLE_DEFAULT_CLIENT_ID = 'no'
+process.env.GOOGLE_DEFAULT_CLIENT_SECRET = 'no'
+
+// ─── Encrypted DNS (DNS-over-HTTPS) ─────────────────────────────────────────────
+// RFC 8484 DoH server templates. Cloudflare is primary, Google the fallback —
+// both are privacy-respecting public resolvers. In 'secure' mode Chromium sends
+// every lookup over HTTPS to these and does NOT fall back to plaintext system DNS,
+// so DNS queries can't be observed or tampered with on the local network.
+const DOH_SERVERS = [
+  'https://cloudflare-dns.com/dns-query',
+  'https://dns.google/dns-query',
+]
+
+// Applies the current Secure-DNS setting to Chromium's host resolver. Must be
+// called after the `ready` event. Safe to call again when the setting changes;
+// the host resolver cache is flushed so the new mode takes effect immediately.
+function applySecureDns() {
+  const enabled = privacy.getSettings().secureDns
+  try {
+    app.configureHostResolver({
+      enableBuiltInResolver: true,
+      secureDnsMode: enabled ? 'secure' : 'off',
+      secureDnsServers: enabled ? DOH_SERVERS : [],
+      enableAdditionalDnsQueryTypes: true,
+    })
+  } catch (err) {
+    console.warn('[ServeSafe] configureHostResolver failed:', err.message)
+  }
+  try { session.defaultSession.clearHostResolverCache() } catch {}
+  try { session.fromPartition('incognito').clearHostResolverCache() } catch {}
+}
+
 // ─── Per-window state ─────────────────────────────────────────────────────────
 // Each BrowserWindow gets its own state object so multiple windows are fully
 // isolated: separate tab sets, BrowserViews, overlay flags, chrome heights, etc.
@@ -44,13 +135,14 @@ const windowStates = new Map()  // winId -> state
 function createWindowState(win) {
   return {
     win,
-    browserViews:       new Map(),  // tabId -> BrowserView
-    trackerStats:       new Map(),  // tabId -> count
-    adStats:            new Map(),  // tabId -> count
-    activeTabId:        null,
-    chromeHeight:       88,
-    chromeHeightTimer:  null,
-    overlayActive:      false,
+    browserViews:         new Map(),  // tabId -> BrowserView
+    trackerStats:         new Map(),  // tabId -> count
+    adStats:              new Map(),  // tabId -> count
+    cryptoMiningStats:    new Map(),  // tabId -> count
+    activeTabId:          null,
+    chromeHeight:         88,
+    chromeHeightTimer:    null,
+    overlayActive:        false,
   }
 }
 
@@ -140,56 +232,168 @@ app.on('web-contents-created', (_, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }))
 })
 
+// ─── Domain isolation helpers ──────────────────────────────────────────────────
+// Two hosts are "same site" if they are identical or one is a subdomain of the
+// other (e.g. www.site.com ↔ site.com). Used to decide whether a cookie is being
+// set/sent in a first-party or third-party context.
+function isSameSite(a, b) {
+  if (!a || !b) return false
+  if (a === b) return true
+  return a.endsWith('.' + b) || b.endsWith('.' + a)
+}
+
+// Harden Set-Cookie headers so cookies that survive are isolated to their origin:
+//  • No SameSite attribute → SameSite=Lax (matches the modern browser default;
+//    prevents the cookie from riding along on cross-site sub-requests/POSTs).
+//  • SameSite=None without Secure → add Secure (spec-required; Chromium rejects
+//    such cookies outright otherwise — this fixes, not breaks, the cookie).
+// Correctly-configured cross-site cookies (SameSite=None; Secure) are untouched.
+function hardenSetCookie(cookies) {
+  const list = Array.isArray(cookies) ? cookies : [cookies]
+  return list.map(c => {
+    if (typeof c !== 'string') return c
+    const hasSameSite = /;\s*samesite=/i.test(c)
+    const isNone = /;\s*samesite=none/i.test(c)
+    const hasSecure = /;\s*secure\b/i.test(c)
+    if (!hasSameSite) return c + '; SameSite=Lax'
+    if (isNone && !hasSecure) return c + '; Secure'
+    return c
+  })
+}
+
+// ─── Fine-grained permissions ───────────────────────────────────────────────────
+// Managed permission types that support per-site overrides + a global default.
+// camera/microphone come from Electron's combined 'media' request (split by
+// details.mediaTypes); clipboard covers clipboard-read; midi covers midi/midiSysex.
+const PERMISSION_TYPES = ['camera', 'microphone', 'geolocation', 'notifications', 'clipboard', 'midi']
+const PERMISSION_POLICIES = ['ask', 'allow', 'block']
+// Hard-coded fallback defaults. clipboard is 'allow' to preserve the prior
+// auto-grant of clipboard-read; everything else prompts until the user decides.
+const PERMISSION_DEFAULTS_FALLBACK = {
+  camera: 'ask', microphone: 'ask', geolocation: 'ask',
+  notifications: 'ask', clipboard: 'allow', midi: 'ask',
+}
+
+function getPermissionDefaults() {
+  return { ...PERMISSION_DEFAULTS_FALLBACK, ...(store.get('permissionDefaults', {}) || {}) }
+}
+
+// Map an Electron permission (+ request details) to our managed types. Returns an
+// empty array for permissions we don't manage (caller keeps the legacy behavior).
+function mapPermissionTypes(permission, details) {
+  switch (permission) {
+    case 'media': {
+      const mt = (details && details.mediaTypes) || []
+      const types = []
+      if (mt.includes('video')) types.push('camera')
+      if (mt.includes('audio')) types.push('microphone')
+      return types.length ? types : ['camera', 'microphone']
+    }
+    case 'clipboard-read': return ['clipboard']
+    case 'midi':
+    case 'midiSysex':      return ['midi']
+    case 'geolocation':    return ['geolocation']
+    case 'notifications':  return ['notifications']
+    default:               return []
+  }
+}
+
+// Resolve 'allow' | 'block' | 'ask' for an origin + managed type: a per-site
+// override wins, otherwise the global default.
+function resolvePermission(origin, type) {
+  const perms = store.get('permissions', {})
+  let siteVal = perms?.[origin]?.[type]
+  // Legacy fallback: honor an old combined 'media' grant for camera/microphone.
+  if (siteVal === undefined && (type === 'camera' || type === 'microphone')) {
+    siteVal = perms?.[origin]?.media
+  }
+  if (typeof siteVal === 'boolean') return siteVal ? 'allow' : 'block'
+  const def = getPermissionDefaults()[type]
+  return PERMISSION_POLICIES.includes(def) ? def : 'ask'
+}
+
+// Shows a permission prompt in the owning window and records the pending request.
+// `types` are the managed types (or [rawPermission] for unmanaged ones) that the
+// renderer's answer will be written to. origin/types are bound here in the main
+// process and never trusted from the renderer echo.
+function promptPermission(wc, origin, types, displayType, callback) {
+  const id = newPermId()
+  pendingPermissions.set(id, { callback, origin, types })
+  setTimeout(() => {
+    const pending = pendingPermissions.get(id)
+    if (pending) { pending.callback(false); pendingPermissions.delete(id) }
+  }, 30_000)
+  const ownerWS = getWSByViewWebContentsId(wc.id) || [...windowStates.values()][0]
+  sendToWindow(ownerWS, 'permission-request', { id, origin, permission: displayType, types })
+}
+
 // ─── Session setup helper (used for both default and incognito sessions) ───────
 function setupSession(sess, { incognito = false } = {}) {
-  const SAFE_PERMISSIONS = ['clipboard-read', 'clipboard-sanitized-write', 'fullscreen']
+  const SAFE_PERMISSIONS = ['clipboard-sanitized-write', 'fullscreen']
 
-  // Permission request handler — show UI for camera/mic/geo/notifications
+  // Permission request handler — resolves per-site override → global default, and
+  // only prompts when the decision is still 'ask'. A combined media request is
+  // split into camera/microphone and granted only if BOTH resolve to allow.
   sess.setPermissionRequestHandler((wc, permission, callback, details) => {
     if (SAFE_PERMISSIONS.includes(permission)) { callback(true); return }
 
-    // Auto-grant geolocation when a custom location is active
+    const origin = (() => { try { return new URL(wc.getURL()).origin } catch { return '' } })()
+
+    // Auto-grant geolocation when a custom (spoofed) location is active
     if (permission === 'geolocation') {
       const loc = store.get('location', null)
       if (loc && loc.id !== 'auto') { callback(true); return }
     }
 
-    // Check for a previously saved decision
-    const origin = (() => { try { return new URL(wc.getURL()).origin } catch { return '' } })()
-    // Use bracket notation: origins contain dots which dot-prop would split as path segments,
-    // causing 'https://example.com' to collide with other keys.
-    const saved = store.get('permissions', {})?.[origin]?.[permission]
-    if (saved !== undefined) { callback(saved === true); return }
+    const types = mapPermissionTypes(permission, details)
 
-    const id = newPermId()
-    pendingPermissions.set(id, callback)
+    if (types.length === 0) {
+      // Unmanaged permission — keep the legacy saved-decision-or-prompt behavior,
+      // keyed by the raw Electron permission name.
+      const saved = store.get('permissions', {})?.[origin]?.[permission]
+      if (saved !== undefined) { callback(saved === true); return }
+      promptPermission(wc, origin, [permission], permission, callback)
+      return
+    }
 
-    // Auto-deny after 30 seconds
-    setTimeout(() => {
-      if (pendingPermissions.has(id)) {
-        pendingPermissions.get(id)(false)
-        pendingPermissions.delete(id)
-      }
-    }, 30_000)
-
-    // Find the window that owns this webContents and send to it
-    const ownerWS = getWSByViewWebContentsId(wc.id) || [...windowStates.values()][0]
-    sendToWindow(ownerWS, 'permission-request', { id, origin, permission })
+    const resolutions = types.map(t => resolvePermission(origin, t))
+    if (resolutions.includes('block')) { callback(false); return }
+    if (resolutions.every(r => r === 'allow')) { callback(true); return }
+    promptPermission(wc, origin, types, types[0], callback)
   })
 
   sess.setPermissionCheckHandler((wc, permission) => {
     if (SAFE_PERMISSIONS.includes(permission)) return true
     const origin = (() => { try { return new URL(wc.getURL()).origin } catch { return '' } })()
-    return store.get('permissions', {})?.[origin]?.[permission] === true
+    if (permission === 'geolocation') {
+      const loc = store.get('location', null)
+      if (loc && loc.id !== 'auto') return true
+    }
+    const types = mapPermissionTypes(permission, null)
+    if (types.length === 0) {
+      return store.get('permissions', {})?.[origin]?.[permission] === true
+    }
+    return types.every(t => resolvePermission(origin, t) === 'allow')
   })
 
   // Request blocking: synchronous check — all lookups are in-memory Set/array operations.
   // Must be synchronous; Electron 44's network service crashes when onBeforeRequest
   // callbacks are async and concurrent requests pile up before the promise resolves.
-  sess.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, cb) => {
+  // ws://wss:// are listed explicitly: the '*' scheme in a match pattern only covers
+  // http/https, so without these, WebSocket connections (e.g. browser miners talking
+  // to a mining pool, or WebSocket-based trackers) would evade blocking entirely.
+  sess.webRequest.onBeforeRequest({ urls: ['*://*/*', 'ws://*/*', 'wss://*/*'] }, (details, cb) => {
     const settings = privacy.getSettings()
     let cancel = false
     let reason = null
+
+    // Bounce-tracking debounce: if this top-level navigation is a known redirector
+    // carrying its real destination, jump straight there so the tracker host is
+    // never contacted. Main-frame only; decloak is a pure synchronous string parse.
+    if (settings.blockBounceTracking && details.resourceType === 'mainFrame') {
+      const dest = bounceTracker.decloak(details.url)
+      if (dest) { cb({ redirectURL: dest }); return }
+    }
 
     try {
       const { hostname } = new URL(details.url)
@@ -204,10 +408,12 @@ function setupSession(sess, { incognito = false } = {}) {
         cancel = true; reason = 'tracker'
       } else if (settings.blockAds && filterEngine.matchAds(details)) {
         cancel = true; reason = 'ad'
+      } else if (settings.blockCryptoMining && filterEngine.matchCryptoMiner(details)) {
+        cancel = true; reason = 'cryptomining'
       }
     } catch { /* unparseable URL — allow through */ }
 
-    if (cancel && (reason === 'tracker' || reason === 'ad')) {
+    if (cancel && (reason === 'tracker' || reason === 'ad' || reason === 'cryptomining')) {
       const ownerWS = getWSByViewWebContentsId(details.webContentsId)
       if (ownerWS) {
         let tabId
@@ -219,10 +425,14 @@ function setupSession(sess, { incognito = false } = {}) {
             const count = (ownerWS.trackerStats.get(tabId) || 0) + 1
             ownerWS.trackerStats.set(tabId, count)
             sendToWindow(ownerWS, 'tracker-blocked', { tabId, url: details.url, count })
-          } else {
+          } else if (reason === 'ad') {
             const count = (ownerWS.adStats.get(tabId) || 0) + 1
             ownerWS.adStats.set(tabId, count)
             sendToWindow(ownerWS, 'ad-blocked', { tabId, url: details.url, count })
+          } else {
+            const count = (ownerWS.cryptoMiningStats.get(tabId) || 0) + 1
+            ownerWS.cryptoMiningStats.set(tabId, count)
+            sendToWindow(ownerWS, 'cryptomining-blocked', { tabId, url: details.url, count })
           }
         }
       }
@@ -278,10 +488,7 @@ function setupSession(sess, { incognito = false } = {}) {
       try {
         const reqHost = new URL(details.url).hostname
         const refHost = new URL(details.referrer).hostname
-        const isThirdParty = reqHost !== refHost
-          && !reqHost.endsWith('.' + refHost)
-          && !refHost.endsWith('.' + reqHost)
-        if (isThirdParty) delete headers['Cookie']
+        if (!isSameSite(reqHost, refHost)) delete headers['Cookie']
       } catch {}
     }
 
@@ -306,17 +513,59 @@ function setupSession(sess, { incognito = false } = {}) {
         // Prod: no eval, no external connections
         : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; object-src 'none'; base-uri 'self';",
       ]
+    } else if (settings.blockJavaScript) {
+      // Block all script execution on web pages by injecting a restrictive CSP.
+      // Multiple CSP headers are ANDed — this combines with the site's own CSP
+      // without stripping other directives like style-src or img-src.
+      const existingCSP = headers['Content-Security-Policy'] || headers['content-security-policy']
+      const jsBlockCSP = "script-src 'none'; object-src 'none';"
+      if (existingCSP) {
+        const base = Array.isArray(existingCSP) ? existingCSP : [existingCSP]
+        headers['Content-Security-Policy'] = [...base, jsBlockCSP]
+        delete headers['content-security-policy']
+      } else {
+        headers['Content-Security-Policy'] = [jsBlockCSP]
+      }
     }
 
-    if (settings.blockThirdPartyCookies && headers['set-cookie'] && details.referrer) {
+    // Honor the Clear-Site-Data response header — when a site asks to purge its
+    // own cookies/storage/cache (e.g. on logout), actively wipe that origin's data
+    // from the session instead of ignoring the directive.
+    const clearDirective = headers['clear-site-data'] || headers['Clear-Site-Data']
+    if (clearDirective) {
       try {
-        const reqHost = new URL(details.url).hostname
-        const refHost = new URL(details.referrer).hostname
-        const isThirdParty = reqHost !== refHost
-          && !reqHost.endsWith('.' + refHost)
-          && !refHost.endsWith('.' + reqHost)
-        if (isThirdParty) delete headers['set-cookie']
+        const val = (Array.isArray(clearDirective) ? clearDirective.join(',') : String(clearDirective)).toLowerCase()
+        const origin = new URL(details.url).origin
+        const all = val.includes('"*"')
+        const storages = []
+        if (all || val.includes('"cookies"')) storages.push('cookies')
+        if (all || val.includes('"storage"')) storages.push('localstorage', 'indexdb', 'serviceworkers', 'cachestorage', 'websql', 'filesystem')
+        if (storages.length) sess.clearStorageData({ origin, storages }).catch(() => {})
+        if (all || val.includes('"cache"')) sess.clearCache().catch(() => {})
       } catch {}
+    }
+
+    // Cookie isolation on the response path:
+    //  • third-party Set-Cookie is dropped entirely (supercookie / cross-site
+    //    tracking prevention) when the user has third-party cookies disabled;
+    //  • first-party cookies that survive are hardened (SameSite/Secure) so they
+    //    stay scoped to their own site.
+    const setCookie = headers['set-cookie'] || headers['Set-Cookie']
+    if (setCookie) {
+      let drop = false
+      if (settings.blockThirdPartyCookies && details.referrer) {
+        try {
+          const reqHost = new URL(details.url).hostname
+          const refHost = new URL(details.referrer).hostname
+          if (!isSameSite(reqHost, refHost)) drop = true
+        } catch {}
+      }
+      delete headers['Set-Cookie']
+      if (drop) {
+        delete headers['set-cookie']
+      } else {
+        headers['set-cookie'] = hardenSetCookie(setCookie)
+      }
     }
 
     cb({ responseHeaders: headers })
@@ -324,6 +573,11 @@ function setupSession(sess, { incognito = false } = {}) {
 
   // Download tracking — broadcast to all open windows
   sess.on('will-download', (event, item) => {
+    if (privacy.getSettings().blockDownloads) {
+      item.cancel()
+      return
+    }
+
     const dlId = `dl_${Date.now()}`
     const filename = item.getFilename()
     const dl = { id: dlId, filename, url: item.getURL(), state: 'progressing', received: 0, total: item.getTotalBytes(), savePath: '' }
@@ -477,11 +731,26 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false }
   })
 
   // ── Navigation events → renderer ──
+  // Set the per-site User-Agent BEFORE the request leaves. will-navigate/will-redirect
+  // cover link clicks and JS-driven navigation; programmatic loadURL calls set it
+  // explicitly (initial load below, and the tab-navigate handler).
+  view.webContents.on('will-navigate', (_, navUrl) => applyUserAgent(view, navUrl))
+  view.webContents.on('will-redirect', (_, navUrl) => applyUserAgent(view, navUrl))
+  // Track the main-frame redirect chain so did-navigate can purge any tracker host
+  // we were bounced through (see purgeBounceHops).
+  view.webContents.on('did-start-navigation', (_, navUrl, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) view._redirectChain = [navUrl]
+  })
+  view.webContents.on('did-redirect-navigation', (_, navUrl, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace && Array.isArray(view._redirectChain)) view._redirectChain.push(navUrl)
+  })
   view.webContents.on('did-navigate', (_, navUrl) => {
     resetActivity()
+    purgeBounceHops(view, navUrl)      // wipe state for any tracker host bounced through
     sendToWindow(ws, 'tab-navigated', { tabId, url: navUrl })
-    ws.trackerStats.set(tabId, 0) // reset tracker count on full navigation
-    ws.adStats.set(tabId, 0)      // reset ad count on full navigation
+    ws.trackerStats.set(tabId, 0)      // reset tracker count on full navigation
+    ws.adStats.set(tabId, 0)           // reset ad count on full navigation
+    ws.cryptoMiningStats.set(tabId, 0) // reset cryptomining count on full navigation
     view._cosmeticKey = null      // CSS cleared by navigation; allow re-inject on dom-ready
     if (tabId === ws.activeTabId) layoutBrowserView(ws, view)
     // Re-apply location on every full navigation — each cross-origin nav creates a
@@ -514,9 +783,14 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false }
 
   ws.browserViews.set(tabId, view)
   // Keyboard/mouse input inside the BrowserView resets the idle timer
-  view.webContents.on('before-input-event', () => resetActivity())
+  view.webContents.on('before-input-event', () => { resetActivity(); view._interacted = true })
   setupAntiFingerprint(view)  // inject fingerprint protection before first page load
-  if (url && url !== 'about:blank') view.webContents.loadURL(sanitizeURL(url))
+  setupPrivacySignals(view)   // expose GPC / DNT signals to page JS
+  if (url && url !== 'about:blank') {
+    const safe = sanitizeURL(url)
+    applyUserAgent(view, safe)
+    view.webContents.loadURL(safe)
+  }
 
   setupContextMenu(ws, view, tabId)
   return view
@@ -663,12 +937,20 @@ ipcMain.handle('tab-close', requireUnlocked((event, { tabId }) => {
   if (!ws) return
   const view = ws.browserViews.get(tabId)
   if (view) {
+    const wasIncognito = incognitoTabs.has(tabId)
     ws.win.removeBrowserView(view)
     view.webContents.destroy()
     ws.browserViews.delete(tabId)
     incognitoTabs.delete(tabId)
     ws.trackerStats.delete(tabId)
     ws.adStats.delete(tabId)
+    ws.cryptoMiningStats.delete(tabId)
+    // When the last incognito tab (across all windows) closes, wipe the shared
+    // incognito partition so its cookies/storage can't leak into a later
+    // incognito session opened within the same app run.
+    if (wasIncognito && incognitoTabs.size === 0) {
+      try { session.fromPartition('incognito').clearStorageData() } catch {}
+    }
   }
 }))
 
@@ -691,6 +973,7 @@ ipcMain.handle('tab-navigate', requireUnlocked((event, { tabId, url }) => {
       const [w, h] = ws.win.getContentSize()
       view.setBounds({ x: 0, y: ws.chromeHeight, width: w, height: Math.max(1, h - ws.chromeHeight) })
     }
+    applyUserAgent(view, safe)
     view.webContents.loadURL(safe)
     return safe
   }
@@ -766,22 +1049,62 @@ ipcMain.handle('bookmarks-remove', requireUnlocked((_, { url }) => {
 // ─── IPC: Privacy ──────────────────────────────────────────────────────────────
 ipcMain.handle('privacy-get', requireUnlocked(() => privacy.getSettings()))
 
-ipcMain.handle('privacy-save', requireUnlocked((_, patch) => {
+ipcMain.handle('privacy-save', requireUnlocked(async (_, patch) => {
   // Only persist known setting keys — reject arbitrary renderer-supplied keys
-  const ALLOWED_KEYS = ['doNotTrack', 'globalPrivacyControl', 'blockTrackers', 'blockAds', 'httpsOnly', 'blockThirdPartyCookies']
+  const ALLOWED_KEYS = ['doNotTrack', 'globalPrivacyControl', 'blockTrackers', 'blockAds', 'httpsOnly', 'blockThirdPartyCookies', 'blockJavaScript', 'blockDownloads', 'blockCryptoMining', 'antiFingerprinting', 'secureDns', 'blockBounceTracking']
   const safePatch = {}
   for (const key of ALLOWED_KEYS) {
     if (key in patch && typeof patch[key] === 'boolean') safePatch[key] = patch[key]
   }
   const updated = privacy.saveSettings(safePatch)
-  // Re-apply third-party cookie setting to default session
-  applyThirdPartyCookies(session.defaultSession, updated.blockThirdPartyCookies)
+  // Live-apply Secure DNS (DoH) — reconfigure the host resolver and flush its cache
+  if ('secureDns' in safePatch) applySecureDns()
+  // Live-apply GPC / DNT DOM signals — re-register the content script and reload so
+  // the new navigator.globalPrivacyControl / navigator.doNotTrack values take effect.
+  // (The Sec-GPC / DNT request headers already follow the setting with no reload.)
+  if ('globalPrivacyControl' in safePatch || 'doNotTrack' in safePatch) {
+    for (const ws of windowStates.values()) {
+      for (const view of ws.browserViews.values()) {
+        try {
+          await setupPrivacySignals(view)
+          const url = view.webContents.getURL()
+          if (url && url !== 'about:blank') view.webContents.reload()
+        } catch {}
+      }
+    }
+  }
   // Live-apply cosmetic ad filtering to every open view (no reload needed)
   if ('blockAds' in safePatch) {
     for (const ws of windowStates.values()) {
       for (const view of ws.browserViews.values()) {
         if (updated.blockAds) applyCosmeticFilter(view)
         else removeCosmeticFilter(view)
+      }
+    }
+  }
+  // Live-apply anti-fingerprinting: register/unregister the content script and swap
+  // the User-Agent, then reload so the change takes effect on the current document.
+  if ('antiFingerprinting' in safePatch) {
+    for (const ws of windowStates.values()) {
+      for (const view of ws.browserViews.values()) {
+        try {
+          if (updated.antiFingerprinting) await setupAntiFingerprint(view)
+          else await teardownAntiFingerprint(view)
+          const url = view.webContents.getURL()
+          applyUserAgent(view, url)
+          if (url && url !== 'about:blank') view.webContents.reload()
+        } catch {}
+      }
+    }
+  }
+  // Reload all open tabs so the new JS-blocking CSP takes effect immediately
+  if ('blockJavaScript' in safePatch) {
+    for (const ws of windowStates.values()) {
+      for (const view of ws.browserViews.values()) {
+        try {
+          const url = view.webContents.getURL()
+          if (url && url !== 'about:blank') view.webContents.reload()
+        } catch {}
       }
     }
   }
@@ -808,24 +1131,66 @@ ipcMain.handle('cert-add-exception', requireUnlocked((_, { hostname }) => {
 }))
 
 // ─── IPC: Permissions ──────────────────────────────────────────────────────────
-ipcMain.handle('permission-response', requireUnlocked((_, { id, allow, origin, permission }) => {
-  if (!pendingPermissions.has(id)) return  // reject unknown or replayed request IDs
-  pendingPermissions.get(id)(allow === true)  // always boolean to the Electron callback
+ipcMain.handle('permission-response', requireUnlocked((_, { id, allow } = {}) => {
+  const pending = pendingPermissions.get(id)
+  if (!pending) return  // reject unknown or replayed request IDs
+  pending.callback(allow === true)  // always boolean to the Electron callback
   pendingPermissions.delete(id)
+  // Persist using the origin/types bound to this request in the main process —
+  // NOT values echoed back by the renderer. A compromised renderer must not be able
+  // to answer a prompt for origin A while silently saving a grant for origin B
+  // (which setPermissionCheckHandler would then honor without any prompt).
   // Use bracket notation — dot-prop would split origin dots as path segments, enabling
   // path-collision attacks where 'https://bank' + 'com.camera' == 'https://bank.com' + 'camera'.
-  if (origin && typeof origin === 'string' && origin.length <= 256 &&
-      permission && typeof permission === 'string' && permission.length <= 64) {
-    const perms = store.get('permissions', {})
-    if (!perms[origin]) perms[origin] = {}
-    perms[origin][permission] = allow === true
-    store.set('permissions', perms)
+  const { origin, types } = pending
+  if (!origin || typeof origin !== 'string' || origin.length > 256) return
+  const perms = store.get('permissions', {})
+  if (!perms[origin]) perms[origin] = {}
+  for (const type of (types || [])) {
+    if (typeof type === 'string' && type.length <= 64) perms[origin][type] = allow === true
   }
+  store.set('permissions', perms)
 }))
 
 ipcMain.handle('permissions-get', requireUnlocked(() => store.get('permissions', {})))
 
 ipcMain.handle('permissions-clear', requireUnlocked(() => store.delete('permissions')))
+
+// Global per-type defaults (applied when a site has no explicit override)
+ipcMain.handle('permission-defaults-get', requireUnlocked(() => getPermissionDefaults()))
+
+ipcMain.handle('permission-defaults-set', requireUnlocked((_, patch) => {
+  if (patch && typeof patch === 'object' && !Array.isArray(patch)) {
+    const current = store.get('permissionDefaults', {}) || {}
+    for (const [type, val] of Object.entries(patch)) {
+      if (PERMISSION_TYPES.includes(type) && PERMISSION_POLICIES.includes(val)) current[type] = val
+    }
+    store.set('permissionDefaults', current)
+  }
+  return getPermissionDefaults()
+}))
+
+// Per-site override: set a single origin+type to allow (true) / block (false)
+ipcMain.handle('permission-set', requireUnlocked((_, { origin, type, allow } = {}) => {
+  if (typeof origin === 'string' && origin.length > 0 && origin.length <= 256 && PERMISSION_TYPES.includes(type)) {
+    const perms = store.get('permissions', {})
+    if (!perms[origin]) perms[origin] = {}
+    perms[origin][type] = allow === true
+    store.set('permissions', perms)
+  }
+  return store.get('permissions', {})
+}))
+
+// Per-site reset: remove a single origin+type override (reverts to the default)
+ipcMain.handle('permission-remove', requireUnlocked((_, { origin, type } = {}) => {
+  const perms = store.get('permissions', {})
+  if (origin && perms[origin] && type in perms[origin]) {
+    delete perms[origin][type]
+    if (Object.keys(perms[origin]).length === 0) delete perms[origin]
+    store.set('permissions', perms)
+  }
+  return store.get('permissions', {})
+}))
 
 // ─── IPC: Downloads ────────────────────────────────────────────────────────────
 ipcMain.handle('downloads-get', requireUnlocked(() => downloads))
@@ -853,6 +1218,12 @@ ipcMain.handle('tracker-stats-get', requireUnlocked((event, { tabId }) => {
 ipcMain.handle('ad-stats-get', requireUnlocked((event, { tabId }) => {
   const ws = getWS(event.sender)
   return ws?.adStats.get(tabId) || 0
+}))
+
+// ─── IPC: Cryptomining stats ───────────────────────────────────────────────────
+ipcMain.handle('cryptomining-stats-get', requireUnlocked((event, { tabId }) => {
+  const ws = getWS(event.sender)
+  return ws?.cryptoMiningStats.get(tabId) || 0
 }))
 
 // ─── IPC: Session persistence ─────────────────────────────────────────────────
@@ -967,22 +1338,137 @@ async function removeCosmeticFilter(view) {
 }
 
 
-// Registers a script that runs at document-start in every page context, before
-// any page JS. Survives cross-origin navigations because the registration lives
-// on the webContents (not the renderer process).
+// Registers the anti-fingerprint script to run at document-start in every page
+// context, before any page JS. Survives cross-origin navigations because the
+// registration lives on the webContents (not the renderer process). Gated on the
+// `antiFingerprinting` setting; idempotent so it can be re-run on a live toggle.
 async function setupAntiFingerprint(view) {
   if (!view || view.webContents.isDestroyed()) return
+  if (!privacy.getSettings().antiFingerprinting) return
+  if (view._afpScriptId != null) return  // already registered
   try {
     if (!view.webContents.debugger.isAttached()) {
       view.webContents.debugger.attach('1.3')
     }
-    await view.webContents.debugger.sendCommand(
+    const { identifier } = await view.webContents.debugger.sendCommand(
       'Page.addScriptToEvaluateOnNewDocument',
-      { source: antiFingerprintScript }
+      { source: fingerprint.clientSource() }
     )
+    view._afpScriptId = identifier
   } catch (_) {
     // Non-fatal — view may not support DevTools (e.g. sandboxed subframes)
   }
+}
+
+// Removes the registered anti-fingerprint script (live toggle off).
+async function teardownAntiFingerprint(view) {
+  if (!view || view.webContents.isDestroyed() || view._afpScriptId == null) return
+  try {
+    if (view.webContents.debugger.isAttached()) {
+      await view.webContents.debugger.sendCommand(
+        'Page.removeScriptToEvaluateOnNewDocument',
+        { identifier: view._afpScriptId }
+      )
+    }
+  } catch (_) {}
+  view._afpScriptId = null
+}
+
+// Exposes the Global Privacy Control / Do-Not-Track signals to page JavaScript so
+// consent-management platforms and sites that read them via the DOM (not just the
+// Sec-GPC / DNT request headers, which onBeforeSendHeaders already sends) honour
+// the opt-out. navigator.globalPrivacyControl is defined by the GPC spec; Chromium
+// does not expose it natively, so we inject it at document-start. Each property is
+// only defined when its toggle is on, matching a browser without the signal when
+// off. Re-run (with a reload) whenever either toggle changes.
+async function setupPrivacySignals(view) {
+  if (!view || view.webContents.isDestroyed()) return
+  await teardownPrivacySignals(view)
+  const s = privacy.getSettings()
+  const parts = []
+  if (s.globalPrivacyControl === true) {
+    parts.push("try{Object.defineProperty(Navigator.prototype,'globalPrivacyControl',{get:function(){return true;},configurable:true,enumerable:true});}catch(e){}")
+  }
+  if (s.doNotTrack === true) {
+    parts.push("try{Object.defineProperty(Navigator.prototype,'doNotTrack',{get:function(){return '1';},configurable:true,enumerable:true});}catch(e){}")
+  }
+  if (parts.length === 0) return
+  const source = '(function(){' + parts.join('') + '})();'
+  try {
+    if (!view.webContents.debugger.isAttached()) view.webContents.debugger.attach('1.3')
+    const { identifier } = await view.webContents.debugger.sendCommand(
+      'Page.addScriptToEvaluateOnNewDocument', { source }
+    )
+    view._signalsScriptId = identifier
+  } catch (_) {
+    // Non-fatal — view may not support DevTools (e.g. sandboxed subframes)
+  }
+}
+
+async function teardownPrivacySignals(view) {
+  if (!view || view.webContents.isDestroyed() || view._signalsScriptId == null) return
+  try {
+    if (view.webContents.debugger.isAttached()) {
+      await view.webContents.debugger.sendCommand(
+        'Page.removeScriptToEvaluateOnNewDocument',
+        { identifier: view._signalsScriptId }
+      )
+    }
+  } catch (_) {}
+  view._signalsScriptId = null
+}
+
+// Applies the per-session, per-site User-Agent for the page being loaded so the
+// network UA matches the platform/GPU/userAgentData the injected script exposes.
+// When anti-fingerprinting is off, restores the view's original (Electron) UA.
+function applyUserAgent(view, url) {
+  if (!view || view.webContents.isDestroyed()) return
+  try {
+    if (view._defaultUA == null) view._defaultUA = view.webContents.getUserAgent()
+    if (privacy.getSettings().antiFingerprinting) {
+      const ua = fingerprint.uaForUrl(url)
+      if (ua) view.webContents.setUserAgent(ua)
+    } else {
+      view.webContents.setUserAgent(view._defaultUA)
+    }
+  } catch (_) {}
+}
+
+// ─── Bounce-tracking storage purge ──────────────────────────────────────────────
+// Called on every committed main-frame navigation. Wipes cookies/storage for any
+// tracker host we passed THROUGH without stopping on — both server-redirect hops
+// (captured in view._redirectChain) and quick JS redirects (a tracker host that we
+// navigated away from, to a different site, with no user interaction). This is the
+// Firefox Bounce Tracking Protection behaviour: bounce trackers never get to keep
+// a first-party identifier.
+function hostOf(url) { try { return new URL(url).hostname } catch { return '' } }
+
+function purgeBounceHops(view, finalUrl) {
+  if (!privacy.getSettings().blockBounceTracking) return
+  const sess = view.webContents.session
+  const finalHost = hostOf(finalUrl)
+  const now = Date.now()
+
+  // 1. Server-redirect chain: every intermediate hop that isn't the final host.
+  const chain = view._redirectChain || []
+  view._redirectChain = []
+  const seen = new Set()
+  for (const hopUrl of chain) {
+    const h = hostOf(hopUrl)
+    if (!h || h === finalHost || seen.has(h)) continue
+    seen.add(h)
+    if (bounceTracker.isBounceTrackerHost(h)) bounceTracker.purgeHost(sess, h)
+  }
+
+  // 2. JS bounce: left a tracker host for a different site, fast, no interaction.
+  const prev = view._lastNav
+  if (prev && prev.host && prev.host !== finalHost && !view._interacted &&
+      (now - prev.time) < 8000 && !seen.has(prev.host) &&
+      bounceTracker.isBounceTrackerHost(prev.host)) {
+    bounceTracker.purgeHost(sess, prev.host)
+  }
+  view._lastNav = { host: finalHost, time: now }
+  view._interacted = false
 }
 
 // ─── IPC: Location ─────────────────────────────────────────────────────────────
@@ -1009,15 +1495,10 @@ ipcMain.handle('location-set', requireUnlocked(async (_, loc) => {
 ipcMain.handle('get-theme', () => (nativeTheme.shouldUseDarkColors ? 'dark' : 'light'))
 
 // ─── Third-party cookie helper ─────────────────────────────────────────────────
-function applyThirdPartyCookies(sess, block) {
-  // Electron doesn't have a direct API for 3P cookies; approximate via cookie filter
-  // The cleanest cross-version approach: set a cookie policy on the session
-  try {
-    if (block) {
-      sess.cookies.on('changed', () => {}) // placeholder; real enforcement needs Chromium flags
-    }
-  } catch {}
-}
+// Enforcement lives entirely at the request layer: onBeforeSendHeaders strips the
+// Cookie header on third-party sub-requests and onHeadersReceived drops third-party
+// Set-Cookie, both gated on the live `blockThirdPartyCookies` setting. No per-session
+// state needs to be toggled, so there is no apply step on startup or on save.
 
 // ─── App menu ──────────────────────────────────────────────────────────────────
 function buildMenu() {
@@ -1200,13 +1681,13 @@ app.whenReady().then(async () => {
   // Set up default session once
   setupSession(session.defaultSession)
 
+  // Route all DNS over HTTPS (DoH) per the Secure-DNS setting. Must run after
+  // the ready event, which app.whenReady() guarantees.
+  applySecureDns()
+
   // Load the ad/tracker filter engines (cache-first; builds in the background).
   // Non-blocking: request filtering falls back to the static lists until ready.
   filterEngine.init()
-
-  // Apply initial third-party cookie setting
-  const settings = privacy.getSettings()
-  applyThirdPartyCookies(session.defaultSession, settings.blockThirdPartyCookies)
 
   createWindow()
 
