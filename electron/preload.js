@@ -2,7 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 const ALLOWED_EVENTS = [
   'tab-navigated', 'tab-title-updated', 'tab-favicon-updated',
-  'tab-loading', 'tab-nav-state',
+  'tab-loading', 'tab-nav-state', 'tab-audio-changed',
   'tab-created',
   'menu-new-tab', 'menu-close-tab', 'menu-reload', 'menu-force-reload',
   'menu-new-incognito',

@@ -4,7 +4,7 @@ import {
   GlobeIcon, LockIcon, AlertTriangleIcon, AlertOctagonIcon,
   ClockIcon, BookmarkIcon, ShieldIcon, SettingsIcon, EyeOffIcon,
   XIcon, PlusIcon, ReloadIcon, ChevronLeftIcon, ChevronRightIcon,
-  SearchIcon,
+  SearchIcon, VolumeIcon,
 } from './Icons.jsx'
 
 const DEFAULT_SHORTCUTS = [
@@ -57,6 +57,7 @@ const TabItem = React.memo(function TabItem({ tab, isActive, onSwitch, onClose, 
             : <GlobeIcon size={16} className="tab-favicon" />
       }
       <span className="tab-title">{tab.title || t.newTab}</span>
+      {tab.audible && <VolumeIcon size={12} className="tab-audio-icon" />}
       <button
         className="tab-close"
         onClick={e => { e.stopPropagation(); onClose(tab.id) }}
@@ -71,7 +72,6 @@ export const TabBar = React.memo(function TabBar({ tabs, activeId, onSwitch, onC
   const t = useT()
   const dragRef = useRef(null)
   const barRef = useRef(null)
-  const actionsRef = useRef(null)
   const tabRefs = useRef({}) // { [id]: HTMLElement }
   const [overflowStart, setOverflowStart] = useState(Infinity)
   const [showMenu, setShowMenu] = useState(false)
@@ -80,17 +80,16 @@ export const TabBar = React.memo(function TabBar({ tabs, activeId, onSwitch, onC
     const bar = barRef.current
     if (!bar) return
 
-    // Padding reserved by CSS (macOS traffic lights + right padding)
-    const PADDING = 80 + 8
-    const actionsW = actionsRef.current?.offsetWidth ?? 62
+    // Padding reserved by CSS (macOS traffic lights left + actions right)
+    const PADDING = 80 + 72
     const MORE_BTN = 38 // "▾ N" button
-    const totalForTabs = bar.clientWidth - PADDING - actionsW
+    const totalForTabs = bar.clientWidth - PADDING
 
     const fit = (limit) => {
       let used = 0
       for (let i = 0; i < tabs.length; i++) {
         const el = tabRefs.current[tabs[i].id]
-        const w = (el instanceof HTMLElement ? el.offsetWidth : 120) + 2 // +2 gap
+        const w = (el instanceof HTMLElement ? el.offsetWidth : 170) + 2 // +2 gap
         if (used + w > limit) return i
         used += w
       }
@@ -186,7 +185,7 @@ export const TabBar = React.memo(function TabBar({ tabs, activeId, onSwitch, onC
         </div>
       )}
 
-      <div ref={actionsRef} className="tab-bar-actions">
+      <div className="tab-bar-actions">
         <button className="new-tab-btn" onClick={onNew} title={t.newTabBtnTitle}><PlusIcon size={16} /></button>
         <button className="new-tab-btn incognito-btn" onClick={onNewIncognito} title={t.newIncognitoTabTitle}><EyeOffIcon size={14} /></button>
       </div>

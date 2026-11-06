@@ -112,6 +112,9 @@ function BrowserApp() {
   // ── Tabs ────────────────────────────────────────────────────────────────────
   const [tabs, setTabs] = useState([])
   const [activeId, setActiveId] = useState(null)
+  // Tracks background tabs whose BrowserView hasn't been created yet.
+  // Map<tabId, url> — populated in openNewTab, consumed in switchTab/closeTab.
+  const lazyTabsRef = useRef(new Map())
 
   // ── Panels ──────────────────────────────────────────────────────────────────
   const [showHistory, setShowHistory] = useState(false)
@@ -262,7 +265,7 @@ function BrowserApp() {
     const cleanups = [
       // Urgent navigation updates — unwrapped
       api.on('tab-navigated', ({ tabId, url }) => {
-        updateTab(tabId, { url })
+        updateTab(tabId, { url, audible: false })
         setCertErrorTabs(prev => { const next = new Set(prev); next.delete(tabId); return next })
         setCertWarning(prev => (prev?.tabId === tabId ? null : prev))
       }),
@@ -284,6 +287,9 @@ function BrowserApp() {
       }),
       api.on('tab-favicon-updated', ({ tabId, favicon }) =>
         startTransition(() => updateTab(tabId, { favicon }))
+      ),
+      api.on('tab-audio-changed', ({ tabId, audible }) =>
+        startTransition(() => updateTab(tabId, { audible: !!audible }))
       ),
       api.on('tracker-blocked', ({ tabId, count }) =>
         startTransition(() => setTrackerCounts(prev => ({ ...prev, [tabId]: count })))
@@ -308,11 +314,19 @@ function BrowserApp() {
     setTabs(prev => prev.map(t => t.id === id ? { ...t, ...patch } : t)), [])
 
   const openNewTab = useCallback(async (url = '') => {
-    const id = await api.createTab(url || undefined)
-    setTabs(prev => [...prev, { id, url: url || '', title: 'New Tab', favicon: null, loading: !!url, canGoBack: false, canGoForward: false, incognito: false }])
-    setActiveId(id)
+    if (activeId == null) {
+      // First tab — create immediately and activate
+      const id = await api.createTab(url || undefined)
+      setTabs(prev => [...prev, { id, url: url || '', title: 'New Tab', favicon: null, loading: !!url, canGoBack: false, canGoForward: false, incognito: false }])
+      setActiveId(id)
+      return id
+    }
+    // Background tab — defer BrowserView creation until first interaction
+    const id = `tab_${Date.now()}`
+    lazyTabsRef.current.set(id, url || '')
+    setTabs(prev => [...prev, { id, url: url || '', title: 'New Tab', favicon: null, loading: false, canGoBack: false, canGoForward: false, incognito: false }])
     return id
-  }, [])
+  }, [activeId])
 
   const openIncognitoTab = useCallback(async (url = '') => {
     const id = await api.createIncognitoTab(url || undefined)
@@ -322,6 +336,7 @@ function BrowserApp() {
   }, [])
 
   const closeTab = useCallback(async (id) => {
+    lazyTabsRef.current.delete(id)  // no-op if not lazy
     await api.closeTab(id)
     setTabs(prev => {
       const next = prev.filter(t => t.id !== id)
@@ -344,6 +359,14 @@ function BrowserApp() {
   }, [activeId, openNewTab])
 
   const switchTab = useCallback(async (id) => {
+    if (lazyTabsRef.current.has(id)) {
+      const url = lazyTabsRef.current.get(id)
+      lazyTabsRef.current.delete(id)
+      // First interaction — create and show the BrowserView now
+      await api.createTab(url || undefined, { tabId: id })
+      setActiveId(id)
+      return
+    }
     await api.switchTab(id)
     setActiveId(id)  // must be immediate — BrowserView already swapped
   }, [])

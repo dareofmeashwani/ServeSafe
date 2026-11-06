@@ -689,7 +689,7 @@ function layoutBrowserView(ws, view) {
 }
 
 // ─── Tab helpers ───────────────────────────────────────────────────────────────
-function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false } = {}) {
+function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false, background = false } = {}) {
   const viewSession = incognito ? session.fromPartition('incognito') : session.defaultSession
 
   const view = new BrowserView({
@@ -748,6 +748,7 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false }
     resetActivity()
     purgeBounceHops(view, navUrl)      // wipe state for any tracker host bounced through
     sendToWindow(ws, 'tab-navigated', { tabId, url: navUrl })
+    sendToWindow(ws, 'tab-audio-changed', { tabId, audible: false })
     ws.trackerStats.set(tabId, 0)      // reset tracker count on full navigation
     ws.adStats.set(tabId, 0)           // reset ad count on full navigation
     ws.cryptoMiningStats.set(tabId, 0) // reset cryptomining count on full navigation
@@ -781,6 +782,13 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false }
     })
   })
 
+  view.webContents.on('media-started-playing', () =>
+    sendToWindow(ws, 'tab-audio-changed', { tabId, audible: true })
+  )
+  view.webContents.on('media-paused', () =>
+    sendToWindow(ws, 'tab-audio-changed', { tabId, audible: false })
+  )
+
   ws.browserViews.set(tabId, view)
   // Keyboard/mouse input inside the BrowserView resets the idle timer
   view.webContents.on('before-input-event', () => { resetActivity(); view._interacted = true })
@@ -789,7 +797,11 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false }
   if (url && url !== 'about:blank') {
     const safe = sanitizeURL(url)
     applyUserAgent(view, safe)
-    view.webContents.loadURL(safe)
+    if (background) {
+      view._pendingUrl = safe  // defer load until tab is first shown
+    } else {
+      view.webContents.loadURL(safe)
+    }
   }
 
   setupContextMenu(ws, view, tabId)
@@ -811,8 +823,8 @@ function setupContextMenu(ws, view, tabId) {
     // Link actions
     if (params.linkURL) {
       sections.push([
-        { label: 'Open Link in New Tab', click: () => openInNewTab(ws, params.linkURL, true, incognitoTabs.has(tabId)) },
         { label: 'Open Link in Background Tab', click: () => openInNewTab(ws, params.linkURL, false, incognitoTabs.has(tabId)) },
+        { label: 'Open Link in New Tab', click: () => openInNewTab(ws, params.linkURL, true, incognitoTabs.has(tabId)) },
         { label: 'Copy Link Address', click: () => clipboard.writeText(params.linkURL) },
       ])
     }
@@ -897,7 +909,15 @@ function showTab(ws, tabId) {
   ws.browserViews.forEach(view => ws.win.removeBrowserView(view))
   ws.activeTabId = tabId
   const view = ws.browserViews.get(tabId)
-  if (view) layoutBrowserView(ws, view)
+  if (view) {
+    if (view._pendingUrl) {
+      const pending = view._pendingUrl
+      delete view._pendingUrl
+      applyUserAgent(view, pending)
+      view.webContents.loadURL(pending)
+    }
+    layoutBrowserView(ws, view)
+  }
 }
 
 // ─── History ───────────────────────────────────────────────────────────────────
@@ -914,13 +934,13 @@ function addHistory(url, title, tabId) {
 }
 
 // ─── IPC: Tab management ───────────────────────────────────────────────────────
-ipcMain.handle('tab-create', requireUnlocked((event, { url, background = false } = {}) => {
+ipcMain.handle('tab-create', requireUnlocked((event, { url, background = false, tabId } = {}) => {
   const ws = getWS(event.sender)
   if (!ws) return
-  const tabId = `tab_${Date.now()}`
-  createBrowserView(ws, tabId, url)
-  if (!background) showTab(ws, tabId)
-  return tabId
+  const id = tabId || `tab_${Date.now()}`
+  createBrowserView(ws, id, url, { background })
+  if (!background) showTab(ws, id)
+  return id
 }))
 
 ipcMain.handle('tab-create-incognito', requireUnlocked((event, { url } = {}) => {

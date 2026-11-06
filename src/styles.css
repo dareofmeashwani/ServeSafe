@@ -31,6 +31,10 @@
   --input-bg: #3a3a3a;
 }
 
+html, body {
+  overflow: hidden;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -62,11 +66,13 @@ input { font: inherit; color: var(--text); }
 
 .tab-bar {
   display: flex;
-  align-items: flex-end;
-  padding: 6px 8px 0;
+  align-items: flex-start;
+  padding: 0 8px 6px;
   padding-left: 80px; /* macOS traffic lights */
+  padding-right: 72px; /* reserved for tab-bar-actions */
   gap: 2px;
   overflow: visible;
+  position: relative;
   -webkit-app-region: drag;
 }
 
@@ -74,11 +80,12 @@ input { font: inherit; color: var(--text); }
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 120px;
-  max-width: 220px;
+  width: 170px;
+  min-width: 170px;
+  max-width: 170px;
   height: 32px;
   padding: 0 10px;
-  border-radius: 8px 8px 0 0;
+  border-radius: 0 0 8px 8px;
   background: var(--tab-bg);
   cursor: pointer;
   flex-shrink: 0;
@@ -89,7 +96,7 @@ input { font: inherit; color: var(--text); }
 .tab.active {
   background: var(--tab-active);
   color: var(--text);
-  box-shadow: inset 0 2px 0 0 var(--accent), 0 2px 6px rgba(0,0,0,0.12);
+  box-shadow: inset 0 -2px 0 0 var(--accent), 0 2px 6px rgba(0,0,0,0.12);
 }
 .tab:not(.active) { color: var(--text-muted); }
 .tab:not(.active) .tab-favicon { opacity: 0.7; }
@@ -103,14 +110,17 @@ input { font: inherit; color: var(--text); }
 .tab:hover .tab-close, .tab.active .tab-close { opacity: 1; }
 .tab-close:hover { background: var(--btn-hover); opacity: 1; }
 
-.new-tab-btn { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; opacity: 0.6; flex-shrink: 0; -webkit-app-region: no-drag; margin-bottom: 2px; }
+.tab-audio-icon { flex-shrink: 0; opacity: 0.75; color: var(--accent); animation: tab-audio-pulse 2s ease-in-out infinite; }
+.tab.active .tab-audio-icon { opacity: 1; }
+
+.new-tab-btn { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; opacity: 0.6; flex-shrink: 0; -webkit-app-region: no-drag; margin-top: 2px; }
 .new-tab-btn:hover { opacity: 1; background: var(--btn-hover); }
 
 /* ── Tab bar actions (new-tab buttons group) ─────────────────────────────────── */
-.tab-bar-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; -webkit-app-region: no-drag; }
+.tab-bar-actions { position: absolute; right: 8px; top: 2px; display: flex; align-items: center; gap: 2px; -webkit-app-region: no-drag; }
 
 /* ── Tab overflow dropdown ───────────────────────────────────────────────────── */
-.tab-overflow-wrap { position: relative; flex-shrink: 0; -webkit-app-region: no-drag; margin-bottom: 2px; }
+.tab-overflow-wrap { position: relative; flex-shrink: 0; -webkit-app-region: no-drag; margin-top: 2px; }
 .tab-overflow-btn {
   height: 28px; padding: 0 8px; border-radius: 4px; font-size: 12px; font-weight: 500;
   opacity: 0.7; white-space: nowrap; -webkit-app-region: no-drag; color: inherit;
@@ -402,6 +412,7 @@ input { font: inherit; color: var(--text); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes slideInRight { from { transform: translateX(40px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@keyframes tab-audio-pulse { 0%, 100% { opacity: 0.75; } 50% { opacity: 0.4; } }
 
 /* ── Lock screen ──────────────────────────────────────────────────────────────── */
 .lock-screen {
