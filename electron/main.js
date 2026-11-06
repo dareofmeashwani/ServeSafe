@@ -688,6 +688,23 @@ function layoutBrowserView(ws, view) {
   view.setBounds({ x: 0, y: ws.chromeHeight, width: w, height: Math.max(1, h - ws.chromeHeight) })
 }
 
+// Detach every BrowserView from the window — used when a full-window React
+// surface (lock screen, overlay panel) must own the screen. Media in detached
+// views pauses, which is the desired behavior for lock/overlay.
+function detachAllBrowserViews(ws) {
+  if (!ws.win) return
+  ws.browserViews.forEach(view => ws.win.removeBrowserView(view))
+}
+
+// Clear the overlay flag and re-surface the active tab in every window — used
+// after the lock screen is dismissed so content (and its views) come back.
+function restoreAllActiveViews() {
+  for (const ws of windowStates.values()) {
+    ws.overlayActive = false
+    if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) showTab(ws, ws.activeTabId)
+  }
+}
+
 // ─── Tab helpers ───────────────────────────────────────────────────────────────
 function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false, background = false } = {}) {
   const viewSession = incognito ? session.fromPartition('incognito') : session.defaultSession
@@ -702,6 +719,9 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false, 
       allowRunningInsecureContent: false,
       experimentalFeatures: false,
       enableBlinkFeatures: '',
+      // Keep audio/video playing in detached (background) tabs — without this
+      // Chromium throttles hidden views and media stops on tab switch.
+      backgroundThrottling: false,
     },
   })
 
@@ -811,7 +831,7 @@ function createBrowserView(ws, tabId, url = 'about:blank', { incognito = false, 
 // ─── Context menu for BrowserViews ────────────────────────────────────────────
 function openInNewTab(ws, url, switchTo = true, incognito = false) {
   const newTabId = `tab_${Date.now()}`
-  createBrowserView(ws, newTabId, url, { incognito })
+  createBrowserView(ws, newTabId, url, { incognito, background: !switchTo })
   if (switchTo) showTab(ws, newTabId)
   sendToWindow(ws, 'tab-created', { tabId: newTabId, url, incognito, switchTo })
 }
@@ -905,18 +925,53 @@ function sanitizeURL(input) {
 }
 
 function showTab(ws, tabId) {
-  // Detach every view first — only one is ever in the window at a time.
-  ws.browserViews.forEach(view => ws.win.removeBrowserView(view))
   ws.activeTabId = tabId
-  const view = ws.browserViews.get(tabId)
-  if (view) {
-    if (view._pendingUrl) {
-      const pending = view._pendingUrl
-      delete view._pendingUrl
-      applyUserAgent(view, pending)
-      view.webContents.loadURL(pending)
+  const active = ws.browserViews.get(tabId)
+  if (!active) return
+
+  if (active._pendingUrl) {
+    const pending = active._pendingUrl
+    delete active._pendingUrl
+    applyUserAgent(active, pending)
+    active.webContents.loadURL(pending)
+  }
+
+  // While a full-window React surface owns the screen, don't surface any view.
+  if (ws.overlayActive) {
+    detachAllBrowserViews(ws)
+    return
+  }
+
+  const activeIsBlank = (() => {
+    const u = active.webContents.getURL()
+    return !u || u === 'about:blank'
+  })()
+
+  // Keep inactive tabs ATTACHED (not removed) so Chromium still reports them as
+  // visible and their audio/video keeps playing after a tab switch. The active
+  // view is raised on top to cover them. When the active tab is the blank
+  // new-tab page (which must render React underneath), park the others
+  // off-screen so they don't paint over the UI while still staying "visible".
+  ws.browserViews.forEach((view, id) => {
+    if (id === tabId) return
+    const u = view.webContents.getURL()
+    if (!u || u === 'about:blank') {
+      ws.win.removeBrowserView(view)
+      return
     }
-    layoutBrowserView(ws, view)
+    if (!ws.win.getBrowserViews().includes(view)) ws.win.addBrowserView(view)
+    if (activeIsBlank) {
+      // Off-screen but attached → playback continues, nothing painted on top of React.
+      view.setBounds({ x: -20000, y: 0, width: 800, height: 600 })
+    } else {
+      const [w, h] = ws.win.getContentSize()
+      view.setBounds({ x: 0, y: ws.chromeHeight, width: w, height: Math.max(1, h - ws.chromeHeight) })
+    }
+  })
+
+  layoutBrowserView(ws, active)
+  if (!activeIsBlank && ws.win.getBrowserViews().includes(active)) {
+    ws.win.setTopBrowserView(active)
   }
 }
 
@@ -1275,9 +1330,7 @@ ipcMain.handle('overlay-open', requireUnlocked((event) => {
   const ws = getWS(event.sender)
   if (!ws) return
   ws.overlayActive = true
-  if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
-    ws.win.removeBrowserView(ws.browserViews.get(ws.activeTabId))
-  }
+  detachAllBrowserViews(ws)
 }))
 
 ipcMain.handle('overlay-close', requireUnlocked((event) => {
@@ -1285,7 +1338,7 @@ ipcMain.handle('overlay-close', requireUnlocked((event) => {
   if (!ws) return
   ws.overlayActive = false
   if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
-    layoutBrowserView(ws, ws.browserViews.get(ws.activeTabId))
+    showTab(ws, ws.activeTabId)  // restore active on top + inactive media tabs behind
   }
 }))
 
@@ -1598,6 +1651,7 @@ ipcMain.handle('app-auth', async (_, { reason } = {}) => {
     store.delete('failedAuthAttempts')
     isAppLocked = false
     resetActivity()
+    restoreAllActiveViews()
     return { success: true, attemptsLeft: MAX_AUTH_ATTEMPTS }
   }
 
@@ -1608,6 +1662,7 @@ ipcMain.handle('app-auth', async (_, { reason } = {}) => {
     store.delete('failedAuthAttempts')
     isAppLocked = false
     resetActivity()
+    restoreAllActiveViews()
     return { success: true, attemptsLeft: MAX_AUTH_ATTEMPTS }
   } catch (err) {
     failed += 1
@@ -1687,12 +1742,10 @@ app.whenReady().then(async () => {
     if (minutes === 0) return  // 0 = disabled
     if (Date.now() - lastActivity >= minutes * 60_000) {
       isAppLocked = true
-      // Hide active BrowserView in every window so the lock screen is visible.
+      // Hide every BrowserView in each window so the lock screen is visible.
       for (const ws of windowStates.values()) {
         ws.overlayActive = true
-        if (ws.activeTabId && ws.browserViews.has(ws.activeTabId)) {
-          ws.win.removeBrowserView(ws.browserViews.get(ws.activeTabId))
-        }
+        detachAllBrowserViews(ws)
         sendToWindow(ws, 'lock-app', {})
       }
     }
